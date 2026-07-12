@@ -5,9 +5,11 @@ import unittest
 import logging
 import time
 from pathlib import Path
+from zipfile import ZipFile
 
 from mmo_app.application import Application
 from mmo_app.database import Database
+from mmo_app.reporting import build_pipeline_report_rows, export_pipeline_report
 from mmo_app import services
 from mmo_app.services import ManualAction, ProcessHandler, UploadHandler, YouTubeService
 from mmo_app.settings import Settings
@@ -148,6 +150,58 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual("TikTok_ Main_01", handler._output_group("UCfolder"))
         self.assertEqual("UCunmapped", handler._output_group("UCunmapped"))
 
+    def test_pipeline_report_exports_excel_rows(self):
+        with self.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO channels(channel_id,title,source_url) VALUES ('UCreport','YouTube A','https://youtube.com/@a')"
+            )
+            media_id = connection.execute(
+                """INSERT INTO media_items(youtube_video_id,channel_id,title,source_url)
+                   VALUES ('report00001','UCreport','Report title','https://www.youtube.com/watch?v=report00001')"""
+            ).lastrowid
+            artifact_id = connection.execute(
+                "INSERT INTO artifacts(media_item_id,kind,path,segment_index) VALUES (?,'rendered','001.mp4',1)",
+                (media_id,),
+            ).lastrowid
+            account_id = connection.execute("INSERT INTO tiktok_accounts(name) VALUES ('TikTok A')").lastrowid
+            route_id = connection.execute("INSERT INTO channel_routes(name,account_id) VALUES ('Layout A',?)", (account_id,)).lastrowid
+            connection.execute(
+                "INSERT INTO channel_route_sources(route_id,channel_id,source_url) VALUES (?,?,?)",
+                (route_id, "UCreport", "https://youtube.com/@a"),
+            )
+            task_id = connection.execute(
+                """INSERT INTO upload_tasks(media_item_id,artifact_id,account_id,caption,status)
+                   VALUES (?,?,?,'Report title - Part 1','completed')""",
+                (media_id, artifact_id, account_id),
+            ).lastrowid
+            job_id = connection.execute(
+                """INSERT INTO jobs(kind,media_item_id,idempotency_key,payload,status)
+                   VALUES ('upload',?,?,?, 'completed')""",
+                (media_id, f"upload:{task_id}", f'{{"task_id": {task_id}}}'),
+            ).lastrowid
+            connection.execute("INSERT INTO job_events(job_id,level,message) VALUES (?,'INFO','Hoàn tất')", (job_id,))
+        rows = build_pipeline_report_rows(self.db)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("YouTube A", rows[0].youtube_channel)
+        self.assertEqual("https://youtube.com/@a", rows[0].youtube_channel_url)
+        self.assertEqual("TikTok A", rows[0].tiktok_channel)
+        self.assertEqual("Report title - Part 1", rows[0].title)
+        self.assertEqual("001.mp4", rows[0].rendered_video_path)
+        self.assertEqual("Có", rows[0].has_tiktok_upload)
+        self.assertEqual("Có", rows[0].upload_success)
+        destination = Path(self.temp.name) / "report.xlsx"
+        export_pipeline_report(self.db, destination)
+        with ZipFile(destination) as workbook:
+            sheet = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+            rels = workbook.read("xl/worksheets/_rels/sheet1.xml.rels").decode("utf-8")
+        self.assertIn("Kênh YouTube", sheet)
+        self.assertIn("Path video đã tách", sheet)
+        self.assertIn('hyperlink ref="A2"', sheet)
+        self.assertIn("Report title - Part 1", sheet)
+        self.assertIn("001.mp4", sheet)
+        self.assertIn("TikTok A", sheet)
+        self.assertIn("https://youtube.com/@a", rels)
+
     def test_title_and_part_overlay_filters_use_utf8_text_files(self):
         self.settings.overlay_text_enabled = True
         self.settings.overlay_font_color = "#ffcc00"
@@ -157,6 +211,11 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual(2, len(filters))
         self.assertIn("fontcolor=#ffcc00", filters[0])
         self.assertIn("fontsize=64", filters[0])
+        self.assertIn("box=1", filters[0])
+        self.assertIn("boxcolor=black@0.55", filters[0])
+        self.assertIn("boxborderw=24", filters[0])
+        self.assertIn("y=h*0.08", filters[0])
+        self.assertIn("y=h-text_h-h*0.08", filters[1])
         self.assertEqual("Tiêu đề tiếng Việt", files[0].read_text(encoding="utf-8"))
         self.assertEqual("Part 2", files[1].read_text(encoding="utf-8"))
 

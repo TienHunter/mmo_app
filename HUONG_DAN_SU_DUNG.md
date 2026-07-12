@@ -257,6 +257,82 @@ Public domain WebSub: https://mmo-webhook.example.com
 RSS fallback interval: 900
 ```
 
+### Nếu chưa có public domain: dùng Cloudflare Tunnel nhanh
+
+Nếu bạn chưa có domain public hoặc chưa cấu hình reverse proxy, có thể dùng Cloudflare Tunnel dạng quick tunnel để test WebSub.
+
+#### Bước 1: Tải cloudflared
+
+Tải `cloudflared` cho Windows từ trang chính thức:
+
+```text
+https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+```
+
+Sau khi tải về, bạn có thể đặt file `cloudflared.exe` vào một thư mục dễ nhớ, ví dụ:
+
+```text
+D:\mmo\tools\cloudflared\cloudflared.exe
+```
+
+Hoặc thêm thư mục chứa `cloudflared.exe` vào biến môi trường `PATH` của Windows để có thể gọi `cloudflared` ở mọi cửa sổ PowerShell.
+
+#### Bước 2: Chạy tunnel trỏ về MMO App
+
+Mở PowerShell và chạy:
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8000
+```
+
+Nếu bạn chạy bằng đường dẫn đầy đủ:
+
+```powershell
+& "D:\mmo\tools\cloudflared\cloudflared.exe" tunnel --url http://127.0.0.1:8000
+```
+
+Cloudflare sẽ in ra một URL dạng:
+
+```text
+https://charge-shadow-terminal-neural.trycloudflare.com
+```
+
+URL này là public domain tạm thời. Mỗi lần chạy quick tunnel có thể sinh URL khác, nên nếu đổi URL thì cần cập nhật lại trong MMO App và bấm lưu cấu hình.
+
+#### Bước 3: Nhập vào MMO App
+
+Trong tab `Cấu hình`, nhập:
+
+```text
+WebSub bind host: 127.0.0.1
+WebSub port: 8000
+Public domain WebSub: https://charge-shadow-terminal-neural.trycloudflare.com
+```
+
+App sẽ tự dùng callback:
+
+```text
+https://charge-shadow-terminal-neural.trycloudflare.com/webhook
+```
+
+#### Bước 4: Kiểm tra tunnel có thông không
+
+Mở trình duyệt và truy cập:
+
+```text
+https://charge-shadow-terminal-neural.trycloudflare.com/health
+```
+
+Nếu thấy nội dung tương tự:
+
+```json
+{"status":"ok"}
+```
+
+thì tunnel đã trỏ đúng về MMO App.
+
+Lưu ý: WebSub chỉ nhận video mới sau khi app subscribe thành công. Nếu bạn đăng video lên YouTube trước khi WebSub subscribe xong, video đó có thể không tự đi qua WebSub; khi đó cần chờ RSS fallback hoặc đăng video test mới.
+
 ---
 
 ## 5. Cấu hình xử lý video
@@ -403,6 +479,50 @@ Ví dụ:
 ```text
 http://127.0.0.1:9222
 ```
+
+### Mở Chrome CDP để app upload TikTok
+
+Với chế độ `cdp`, trước khi bấm `Bắt đầu` trong MMO App, bạn cần mở Chrome bằng cổng remote debugging/CDP và đăng nhập TikTok trong cửa sổ Chrome đó.
+
+Ví dụ mở profile TikTok thứ nhất ở cổng `9222`:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\mmo\chrome_profiles\tiktok_1"
+```
+
+Sau khi Chrome mở:
+
+1. Vào:
+
+   ```text
+   https://www.tiktok.com/upload
+   ```
+
+2. Đăng nhập đúng tài khoản TikTok.
+3. Xử lý captcha/xác minh nếu TikTok yêu cầu.
+4. Trong MMO App, ở layout tương ứng nhập:
+
+   ```text
+   TikTok Chrome CDP URL: http://127.0.0.1:9222
+   ```
+
+Nếu có nhiều kênh TikTok, nên dùng mỗi kênh một Chrome profile và một cổng riêng.
+
+Ví dụ:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\mmo\chrome_profiles\tiktok_1"
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9223 --user-data-dir="D:\mmo\chrome_profiles\tiktok_2"
+```
+
+Khi đó:
+
+```text
+TikTok 1 CDP URL: http://127.0.0.1:9222
+TikTok 2 CDP URL: http://127.0.0.1:9223
+```
+
+Quan trọng với PowerShell: phải có ký tự `&` ở đầu lệnh khi chạy đường dẫn `.exe` có dấu cách. Nếu bỏ `&`, PowerShell sẽ báo lỗi kiểu `Unexpected token --remote-debugging-port`.
 
 Nếu chọn `gpm`, cần nhập:
 

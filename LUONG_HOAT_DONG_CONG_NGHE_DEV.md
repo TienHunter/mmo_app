@@ -396,6 +396,62 @@ Không nhầm `webhook_host` với public callback URL. Public callback được
 settings.public_domain + "/webhook"
 ```
 
+### Local tunnel cho môi trường không có public domain
+
+Khi người dùng/dev chưa có public domain cố định, cách test WebSub nhanh nhất là Cloudflare quick tunnel:
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8000
+```
+
+Nếu `cloudflared.exe` không nằm trong `PATH`, chạy bằng đường dẫn đầy đủ:
+
+```powershell
+& "D:\mmo\tools\cloudflared\cloudflared.exe" tunnel --url http://127.0.0.1:8000
+```
+
+Cloudflare sẽ trả về URL tạm dạng:
+
+```text
+https://<random>.trycloudflare.com
+```
+
+Mapping runtime:
+
+```text
+YouTube Hub
+  → https://<random>.trycloudflare.com/webhook
+  → Cloudflare quick tunnel
+  → http://127.0.0.1:8000/webhook
+  → WebSubService HTTP server
+```
+
+Người dùng nhập vào settings:
+
+```text
+webhook_host = 127.0.0.1
+webhook_port = 8000
+public_domain = https://<random>.trycloudflare.com
+```
+
+Endpoint kiểm tra nhanh:
+
+```text
+https://<random>.trycloudflare.com/health
+```
+
+Kỳ vọng:
+
+```json
+{"status":"ok"}
+```
+
+Lưu ý dev:
+
+- Quick tunnel URL có thể thay đổi mỗi lần chạy, nên `Application.start()` đang force `renew_due(force=True)` để subscribe lại theo callback mới.
+- Nếu người dùng đổi `public_domain` khi app đang chạy, `Desktop._save_settings()` gọi `Application.restart_websub()` để bind/subscription được làm mới.
+- WebSub chỉ đảm bảo nhận video mới sau khi subscribe/verify thành công. Video đăng trước thời điểm đó nên để RSS fallback xử lý hoặc yêu cầu người dùng đăng video test mới.
+
 ### RSS fallback flow
 
 ```text
@@ -668,6 +724,36 @@ Upload dùng Chrome đã đăng nhập TikTok qua CDP URL:
 ```text
 http://127.0.0.1:9222
 ```
+
+Chrome phải được mở trước bằng remote debugging port. Lệnh mẫu cho PowerShell:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\mmo\chrome_profiles\tiktok_1"
+```
+
+Với nhiều TikTok account, mỗi account nên dùng một Chrome profile riêng và một port riêng:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="D:\mmo\chrome_profiles\tiktok_1"
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9223 --user-data-dir="D:\mmo\chrome_profiles\tiktok_2"
+```
+
+Mapping sang database/layout:
+
+```text
+tiktok_accounts.name     = TikTok account display name
+tiktok_accounts.mode     = cdp
+tiktok_accounts.endpoint = http://127.0.0.1:9222
+```
+
+PowerShell detail: ký tự `&` là call operator bắt buộc khi đường dẫn EXE nằm trong dấu quote. Nếu thiếu `&`, PowerShell hiểu chuỗi path là expression và các tham số `--remote-debugging-port` sẽ gây lỗi parse.
+
+Trước khi worker upload chạy, người dùng cần đăng nhập TikTok trong đúng Chrome profile đó và xử lý captcha/xác minh nếu có. `UploadHandler` không được tự đánh dấu success khi:
+
+- Chrome CDP không kết nối được;
+- chưa đăng nhập TikTok;
+- TikTok yêu cầu captcha/xác minh;
+- trang upload chưa load đủ element chọn file.
 
 Nếu TikTok yêu cầu đăng nhập/xác minh/captcha, handler phải chuyển `manual_action`, không đánh dấu completed.
 

@@ -312,19 +312,27 @@ class ProcessHandler:
 
     def overlay_filters(self, destination: Path, title: str, part: int, total_parts: int) -> tuple[list[str], list[Path]]:
         font = Path(self.settings.overlay_font_path) if self.settings.overlay_font_path else Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arial.ttf"
-        common = [f"fontcolor={self.settings.overlay_font_color}", f"fontsize={self.settings.overlay_font_size}", "borderw=2", "bordercolor=black"]
+        common = [
+            f"fontcolor={self.settings.overlay_font_color}",
+            f"fontsize={self.settings.overlay_font_size}",
+            "borderw=2",
+            "bordercolor=black",
+            "box=1",
+            "boxcolor=black@0.55",
+            "boxborderw=24",
+        ]
         if font.is_file(): common.insert(0, f"fontfile='{self.escape_filter_path(font)}'")
         paths, filters = [], []
         title_file = destination.with_name(destination.stem + ".title.txt")
         wrapped = "\n".join(textwrap.wrap(title.strip(), width=36, break_long_words=False, break_on_hyphens=False)[:3]) or " "
         title_file.write_text(wrapped, encoding="utf-8")
         paths.append(title_file)
-        filters.append("drawtext=" + ":".join([f"textfile='{self.escape_filter_path(title_file)}'", *common, "x=(w-text_w)/2", "y=40"]))
+        filters.append("drawtext=" + ":".join([f"textfile='{self.escape_filter_path(title_file)}'", *common, "x=(w-text_w)/2", "y=h*0.08"]))
         if total_parts > 1:
             part_file = destination.with_name(destination.stem + ".part.txt")
             part_file.write_text(f"Part {part}", encoding="utf-8")
             paths.append(part_file)
-            filters.append("drawtext=" + ":".join([f"textfile='{self.escape_filter_path(part_file)}'", *common, "x=(w-text_w)/2", "y=h-text_h-50"]))
+            filters.append("drawtext=" + ":".join([f"textfile='{self.escape_filter_path(part_file)}'", *common, "x=(w-text_w)/2", "y=h-text_h-h*0.08"]))
         return filters, paths
 
     @staticmethod

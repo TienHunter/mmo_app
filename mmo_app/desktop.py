@@ -7,6 +7,7 @@ from tkinter import filedialog, messagebox, ttk
 import threading
 
 from .application import Application
+from .reporting import export_pipeline_report
 
 
 class Desktop(tk.Tk):
@@ -49,6 +50,9 @@ class Desktop(tk.Tk):
         self.summary.pack(anchor="w", pady=(0, 8))
         self.websub_status = ttk.Label(self.dashboard, text="", font=("Segoe UI", 10))
         self.websub_status.pack(anchor="w", pady=(0, 8))
+        actions = ttk.Frame(self.dashboard)
+        actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(actions, text="Xuất Excel báo cáo", command=self._export_report).pack(side="left")
         columns = ("id", "title", "media", "kind", "status", "attempts", "error")
         jobs_frame = ttk.Frame(self.dashboard)
         jobs_frame.pack(fill="both", expand=True)
@@ -355,6 +359,21 @@ class Desktop(tk.Tk):
         self.runtime_status.configure(text="● Đã tạm dừng")
         self.start_button.configure(state="normal")
         self.pause_button.configure(state="disabled")
+
+    def _export_report(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Xuất Excel báo cáo flow",
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx")],
+            initialfile="mmo_flow_report.xlsx",
+        )
+        if not path:
+            return
+        try:
+            exported = export_pipeline_report(self.application.database, path)
+            messagebox.showinfo("MMO App", f"Đã xuất báo cáo:\n{exported}")
+        except Exception as exc:
+            messagebox.showerror("Không thể xuất Excel", str(exc))
 
     def _exit(self) -> None:
         if getattr(self, "tray", None): self.tray.stop()
