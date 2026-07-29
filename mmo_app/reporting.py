@@ -94,7 +94,7 @@ def build_pipeline_report_rows(database: Database) -> list[PipelineReportRow]:
                             youtube_channel_url=_youtube_channel_url(media),
                             tiktok_channel=task["account_name"] or (mapped_account["name"] if mapped_account else ""),
                             video_link=media["source_url"] or f"https://www.youtube.com/watch?v={media['youtube_video_id']}",
-                            title=task["caption"] or media["title"] or "",
+                            title=media["title"] or "",
                             rendered_video_path=artifact["path"] or "",
                             has_tiktok_upload="Có",
                             upload_success="Có" if task["status"] == "completed" else "Không",

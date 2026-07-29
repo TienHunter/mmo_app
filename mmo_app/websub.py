@@ -29,6 +29,29 @@ class WebSubService:
     def callback_url(self) -> str:
         return self.settings.public_domain.rstrip("/") + "/webhook"
 
+    def _channel_label(self, channel_id: str) -> str:
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT title,source_url FROM channels WHERE channel_id=?", (channel_id,)
+            ).fetchone()
+        if not row:
+            return channel_id
+        title = (row["title"] or "").strip()
+        source_url = (row["source_url"] or "").strip()
+        if title and source_url:
+            return f"{title} ({source_url}) [{channel_id}]"
+        if title:
+            return f"{title} [{channel_id}]"
+        if source_url:
+            return f"{source_url} [{channel_id}]"
+        return channel_id
+
+    def _event(self, level: str, message: str) -> None:
+        try:
+            self.db.event(None, level, message)
+        except Exception:
+            LOGGER.exception("Could not write WebSub event to job_events")
+
     def start(self) -> None:
         if self.server:
             return
@@ -74,6 +97,10 @@ class WebSubService:
         self.thread = threading.Thread(target=self.server.serve_forever, name="websub-server", daemon=True)
         self.thread.start()
         LOGGER.info("WebSub callback listening on http://%s:%s/webhook", self.settings.webhook_host, self.settings.webhook_port)
+        self._event(
+            "info",
+            f"WebSub đang lắng nghe tại http://{self.settings.webhook_host}:{self.settings.webhook_port}/webhook; callback public: {self.callback_url if self.settings.public_domain else 'chưa cấu hình'}",
+        )
 
     def stop(self) -> None:
         if self.server:
@@ -84,6 +111,7 @@ class WebSubService:
     def renew_due(self, force: bool = False) -> int:
         if not self.settings.public_domain:
             LOGGER.warning("WebSub chưa subscribe: PUBLIC_DOMAIN đang trống")
+            self._event("warning", "WebSub chưa subscribe: Public domain HTTPS đang trống")
             return 0
         self.youtube.sync_channels()
         threshold = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
@@ -99,12 +127,15 @@ class WebSubService:
         succeeded = 0
         for channel in rows:
             try:
+                channel_label = self._channel_label(channel["channel_id"])
                 LOGGER.info("WebSub subscribing channel=%s callback=%s", channel["channel_id"], self.callback_url)
+                self._event("info", f"WebSub gửi yêu cầu subscribe kênh YouTube: {channel_label}")
                 self.subscribe(channel["channel_id"]); succeeded += 1
             except Exception as exc:
                 LOGGER.exception("WebSub subscribe %s failed", channel["channel_id"])
                 with self.db.connect() as connection:
                     connection.execute("UPDATE channels SET subscription_status='error',subscription_error=? WHERE id=?", (str(exc)[:1000], channel["id"]))
+                self._event("error", f"WebSub subscribe lỗi kênh YouTube {self._channel_label(channel['channel_id'])}: {str(exc)[:500]}")
         if rows:
             LOGGER.info("WebSub subscribe requests sent: %s/%s", succeeded, len(rows))
         return succeeded
@@ -121,6 +152,7 @@ class WebSubService:
             if response.status not in {202, 204}:
                 raise RuntimeError(f"YouTube Hub HTTP {response.status}")
             LOGGER.info("WebSub hub accepted subscribe request channel=%s http=%s", channel_id, response.status)
+            self._event("info", f"YouTube Hub đã nhận yêu cầu subscribe kênh: {self._channel_label(channel_id)} (HTTP {response.status})")
         with self.db.connect() as connection:
             connection.execute("UPDATE channels SET subscription_status='pending',subscription_error=NULL WHERE channel_id=?", (channel_id,))
 
@@ -139,8 +171,10 @@ class WebSubService:
                 subscription_error=NULL WHERE channel_id=?""", (status, subscribed, expires, channel_id))
         if mode == "subscribe":
             LOGGER.info("WebSub subscribed channel=%s expires_at=%s", channel_id, expires)
+            self._event("info", f"WebSub đã subscribe thành công kênh YouTube: {self._channel_label(channel_id)}; hết hạn: {expires}")
         else:
             LOGGER.info("WebSub unsubscribed channel=%s", channel_id)
+            self._event("info", f"WebSub đã unsubscribe kênh YouTube: {self._channel_label(channel_id)}")
 
     def receive_notification(self, body: bytes) -> int:
         root = ET.fromstring(body)
@@ -152,9 +186,17 @@ class WebSubService:
             published = entry.findtext(f"{{{ATOM}}}published", "")
             if video_id and channel_id and self.youtube.discover(video_id, channel_id, title, published):
                 LOGGER.info("WebSub notification queued video=%s channel=%s title=%s", video_id, channel_id, title)
+                self._event(
+                    "info",
+                    f"WebSub đã nhận thông báo video mới: {title or video_id} | kênh: {self._channel_label(channel_id)} | link: https://www.youtube.com/watch?v={video_id}",
+                )
                 count += 1
             elif video_id and channel_id:
                 LOGGER.info("WebSub notification ignored duplicate video=%s channel=%s", video_id, channel_id)
+                self._event(
+                    "info",
+                    f"WebSub nhận thông báo video đã có trong hệ thống nên bỏ qua: {title or video_id} | kênh: {self._channel_label(channel_id)} | link: https://www.youtube.com/watch?v={video_id}",
+                )
         if count:
             LOGGER.info("WebSub notification processed new_videos=%s", count)
         return count

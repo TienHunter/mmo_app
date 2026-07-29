@@ -7,6 +7,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
+DEFAULT_GPM_API_URL = "http://127.0.0.1:9495/api/v1"
+LEGACY_GPM_API_URLS = {
+    "http://127.0.0.1:19995/api/v3",
+    "http://localhost:19995/api/v3",
+}
+
+
 def app_data_dir() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     return base / "MMOApp"
@@ -41,9 +48,14 @@ class Settings:
     overlay_font_path: str = ""
     overlay_font_color: str = "white"
     overlay_font_size: int = 56
+    video_zoom_percent: int = 100
+    video_speed: float = 1.0
+    source_orientation_filter: str = "both"
+    video_background_path: str = ""
     tiktok_publish_enabled: bool = False
     tiktok_cdp_url: str = ""
-    gpm_api_url: str = "http://127.0.0.1:19995/api/v3"
+    gpm_api_url: str = DEFAULT_GPM_API_URL
+    gpm_reclaim_profile_in_use: bool = True
     max_upload_workers: int = 1
 
     @property
@@ -64,6 +76,8 @@ class Settings:
         raw = json.loads(path.read_text(encoding="utf-8"))
         allowed = cls.__dataclass_fields__.keys()
         value = cls(**{key: raw[key] for key in allowed if key in raw})
+        if value.gpm_api_url.strip().rstrip("/") in LEGACY_GPM_API_URLS:
+            value.gpm_api_url = DEFAULT_GPM_API_URL
         value.ensure_dirs()
         return value
 

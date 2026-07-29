@@ -11,11 +11,13 @@ import textwrap
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 from .database import Database, utc_now
-from .settings import Settings
+from .settings import DEFAULT_GPM_API_URL, Settings
 
 LOGGER = logging.getLogger(__name__)
 YOUTUBE_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -181,14 +183,40 @@ class DownloadHandler:
             "noplaylist": True,
             "quiet": True,
         }
+        ffmpeg_binary = self.settings.media_binary("ffmpeg")
+        if ffmpeg_binary and (ffmpeg_binary != "ffmpeg" or Path(ffmpeg_binary).exists()):
+            options["ffmpeg_location"] = ffmpeg_binary
+        orientation_filter = self._source_orientation_filter()
         with _hide_child_console_windows():
             with yt_dlp.YoutubeDL(options) as ydl:
+                if orientation_filter != "both":
+                    metadata = ydl.extract_info(media["source_url"], download=False)
+                    metadata_dimensions = self._metadata_dimensions(metadata)
+                    if metadata_dimensions and not self._orientation_allowed(metadata_dimensions, orientation_filter):
+                        self._skip_for_orientation(job, media, metadata_dimensions, orientation_filter, "metadata trước khi tải")
+                        return
+                    if not metadata_dimensions:
+                        self.db.event(
+                            job["id"] if job and "id" in job.keys() else None,
+                            "INFO",
+                            "Download: chưa lấy được hướng video từ metadata YouTube, sẽ tải rồi kiểm tra bằng ffprobe",
+                        )
                 info = ydl.extract_info(media["source_url"], download=True)
                 path = Path(ydl.prepare_filename(info))
         if not path.exists() and path.suffix.lower() != ".mp4":
             path = path.with_suffix(".mp4")
         if not path.is_file() or path.stat().st_size <= 0:
             raise RuntimeError("yt-dlp kết thúc nhưng không tìm thấy output hợp lệ")
+        if orientation_filter != "both":
+            dimensions = self._dimensions(path)
+            if not self._orientation_allowed(dimensions, orientation_filter):
+                self._skip_for_orientation(job, media, dimensions, orientation_filter, "file đã tải")
+                return
+            self.db.event(
+                job["id"] if job and "id" in job.keys() else None,
+                "INFO",
+                f"Download: video {self._orientation_name(dimensions)} khớp bộ lọc {self._orientation_filter_label(orientation_filter)}",
+            )
         with self.db.connect() as connection:
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO artifacts(media_item_id,kind,path,size_bytes) VALUES (?,?,?,?)",
@@ -200,6 +228,136 @@ class DownloadHandler:
             ).fetchone()
             connection.execute("UPDATE media_items SET status='downloaded',updated_at=? WHERE id=?", (utc_now(), media["id"]))
         self.db.enqueue("process", media["id"], f"process:{media['id']}:{artifact['id']}", json.dumps({"artifact_id": artifact["id"]}))
+
+    def _source_orientation_filter(self) -> str:
+        value = str(getattr(self.settings, "source_orientation_filter", "both") or "both").strip().lower()
+        return value if value in {"both", "landscape", "portrait"} else "both"
+
+    @classmethod
+    def _metadata_dimensions(cls, info: dict | None) -> tuple[int, int] | None:
+        if not isinstance(info, dict):
+            return None
+        direct = cls._dimension_pair(info)
+        if direct:
+            return direct
+        for key in ("requested_formats", "formats"):
+            candidates: list[tuple[int, int]] = []
+            for item in info.get(key) or []:
+                pair = cls._dimension_pair(item)
+                if pair:
+                    candidates.append(pair)
+            if candidates:
+                return max(candidates, key=lambda pair: pair[0] * pair[1])
+        return None
+
+    @staticmethod
+    def _dimension_pair(value: dict | None) -> tuple[int, int] | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            width = int(value.get("width") or 0)
+            height = int(value.get("height") or 0)
+        except (TypeError, ValueError):
+            return None
+        if width > 0 and height > 0:
+            return width, height
+        return None
+
+    def _skip_for_orientation(self, job, media, dimensions: tuple[int, int] | None,
+                              orientation_filter: str, source: str) -> None:
+        orientation = self._orientation_name(dimensions)
+        message = (
+            f"Download: bỏ qua video vì hướng {orientation} từ {source} không khớp bộ lọc "
+            f"{self._orientation_filter_label(orientation_filter)}"
+        )
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE media_items SET status='skipped',error_message=?,updated_at=? WHERE id=?",
+                (message, utc_now(), media["id"]),
+            )
+        self.db.event(job["id"] if job and "id" in job.keys() else None, "INFO", message)
+
+    def _dimensions(self, source: Path) -> tuple[int, int] | None:
+        try:
+            result = subprocess.run(
+                [
+                    self.settings.media_binary("ffprobe"),
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=s=x:p=0",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60,
+                **_hidden_subprocess_kwargs(),
+            )
+            width_text, height_text = result.stdout.strip().split("x", 1)
+            width, height = int(width_text), int(height_text)
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _orientation_allowed(dimensions: tuple[int, int] | None, orientation_filter: str) -> bool:
+        if orientation_filter == "both" or not dimensions:
+            return True
+        width, height = dimensions
+        if orientation_filter == "landscape":
+            return width > height
+        if orientation_filter == "portrait":
+            return height > width
+        return True
+
+    @staticmethod
+    def _orientation_name(dimensions: tuple[int, int] | None) -> str:
+        if not dimensions:
+            return "không xác định"
+        width, height = dimensions
+        if width > height:
+            return f"ngang ({width}x{height})"
+        if height > width:
+            return f"dọc ({width}x{height})"
+        return f"vuông ({width}x{height})"
+
+    @staticmethod
+    def _orientation_filter_label(orientation_filter: str) -> str:
+        return {
+            "landscape": "chỉ video ngang",
+            "portrait": "chỉ video dọc",
+            "both": "cả ngang và dọc",
+        }.get(orientation_filter, "cả ngang và dọc")
+
+
+@dataclass(frozen=True)
+class ProcessingOptions:
+    segment_seconds: int
+    aspect_ratio: str
+    zoom_percent: int
+    speed: float
+    background_path: str = ""
+
+
+@dataclass(frozen=True)
+class VideoBox:
+    canvas_width: int
+    canvas_height: int
+    video_width: int
+    video_height: int
+    video_x: int
+    video_y: int
+
+    @property
+    def video_bottom(self) -> int:
+        return self.video_y + self.video_height
 
 
 class ProcessHandler:
@@ -221,21 +379,42 @@ class ProcessHandler:
         if not source_row or not Path(source_row["path"]).is_file():
             raise RuntimeError("Download artifact bị thiếu")
         source = Path(source_row["path"])
+        options = self._processing_options(media["channel_id"] if media else None)
         output_group = self._output_group(media["channel_id"])
         output = Path(self.settings.output_dir) / output_group / (media["youtube_video_id"] or str(media["id"]))
         output.mkdir(parents=True, exist_ok=True)
         duration = self._duration(source)
         segments = []
-        if self.settings.split_enabled and duration > self.settings.segment_seconds:
-            segment_ranges = self.segment_ranges(duration, self.settings.segment_seconds)
+        effective_duration = duration / options.speed
+        if self.settings.split_enabled and effective_duration > options.segment_seconds:
+            segment_ranges = self.segment_ranges(effective_duration, options.segment_seconds)
             total_parts = len(segment_ranges)
-            for index, (start, length) in enumerate(segment_ranges, start=1):
+            self.db.event(
+                job["id"],
+                "INFO",
+                f"Process: duration gốc={duration:.1f}s, speed={options.speed:.3g}x, duration sau speed={effective_duration:.1f}s, target={options.segment_seconds}s, parts={total_parts}",
+            )
+            for index, (output_start, output_length) in enumerate(segment_ranges, start=1):
                 destination = output / f"{index:03d}.mp4"
-                self._render(source, destination, start, length, media["title"] or "", index, total_parts)
+                self._render(
+                    source,
+                    destination,
+                    output_start * options.speed,
+                    output_length * options.speed,
+                    media["title"] or "",
+                    index,
+                    total_parts,
+                    options,
+                )
                 segments.append((index, destination))
         else:
+            self.db.event(
+                job["id"],
+                "INFO",
+                f"Process: duration gốc={duration:.1f}s, speed={options.speed:.3g}x, duration sau speed={effective_duration:.1f}s, không cần cắt",
+            )
             destination = output / "001.mp4"
-            self._render(source, destination, 0, None, media["title"] or "", 1, 1)
+            self._render(source, destination, 0, None, media["title"] or "", 1, 1, options)
             segments.append((1, destination))
         with self.db.connect() as connection:
             for index, path in segments:
@@ -245,6 +424,29 @@ class ProcessHandler:
                 )
             connection.execute("UPDATE media_items SET status='processed',updated_at=? WHERE id=?", (utc_now(), media["id"]))
         self._route_uploads(media["id"], media["title"] or "")
+
+    def _processing_options(self, channel_id: str | None) -> ProcessingOptions:
+        row = None
+        if channel_id:
+            with self.db.connect() as connection:
+                row = connection.execute(
+                    """SELECT segment_seconds,background_path
+                    FROM channel_route_sources s
+                    JOIN channel_routes r ON r.id=s.route_id AND r.active=1
+                    WHERE s.channel_id=? ORDER BY r.id LIMIT 1""",
+                    (channel_id,),
+                ).fetchone()
+        segment_seconds = int((row["segment_seconds"] if row and row["segment_seconds"] else self.settings.segment_seconds) or 60)
+        zoom_percent = int(self.settings.video_zoom_percent if self.settings.video_zoom_percent is not None else 100)
+        speed = float(self.settings.video_speed or 1.0)
+        background_path = str(row["background_path"] if row else self.settings.video_background_path or "").strip()
+        return ProcessingOptions(
+            segment_seconds=max(5, segment_seconds),
+            aspect_ratio=self.settings.output_aspect_ratio,
+            zoom_percent=max(0, min(300, zoom_percent)),
+            speed=max(0.25, min(4.0, speed)),
+            background_path=background_path,
+        )
 
     def _output_group(self, channel_id: str | None) -> str:
         with self.db.connect() as connection:
@@ -269,6 +471,35 @@ class ProcessHandler:
         )
         return float(result.stdout.strip())
 
+    def _dimensions(self, source: Path) -> tuple[int, int] | None:
+        try:
+            result = subprocess.run(
+                [
+                    self.settings.media_binary("ffprobe"),
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=s=x:p=0",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60,
+                **_hidden_subprocess_kwargs(),
+            )
+            width_text, height_text = result.stdout.strip().split("x", 1)
+            width, height = int(width_text), int(height_text)
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            return None
+        return None
+
     @staticmethod
     def segment_ranges(duration: float, target_seconds: int | float) -> list[tuple[float, float]]:
         target = float(target_seconds)
@@ -282,7 +513,7 @@ class ProcessHandler:
             length = min(target, duration - start)
             ranges.append((start, length))
             start += length
-        if len(ranges) > 1 and ranges[-1][1] < target / 2:
+        if len(ranges) > 1 and ranges[-1][1] <= target / 2 + 0.5:
             previous_start, previous_length = ranges[-2]
             _, last_length = ranges[-1]
             ranges[-2] = (previous_start, previous_length + last_length)
@@ -290,19 +521,53 @@ class ProcessHandler:
         return ranges
 
     def _render(self, source: Path, destination: Path, start: float, length: float | None,
-                title: str = "", part: int = 1, total_parts: int = 1) -> None:
-        filters = [item for item in [self.video_filter(self.settings.output_aspect_ratio)] if item]
+                title: str = "", part: int = 1, total_parts: int = 1,
+                options: ProcessingOptions | None = None) -> None:
+        options = options or ProcessingOptions(
+            max(5, int(self.settings.segment_seconds)),
+            self.settings.output_aspect_ratio,
+            max(0, min(300, int(getattr(self.settings, "video_zoom_percent", 100)))),
+            max(0.25, min(4.0, float(getattr(self.settings, "video_speed", 1.0) or 1.0))),
+            str(getattr(self.settings, "video_background_path", "") or ""),
+        )
+        source_dimensions = (
+            self._dimensions(source)
+            if self.settings.overlay_text_enabled and options.aspect_ratio in self.ASPECT_SIZES
+            else None
+        )
+        video_box = self.scaled_video_box(source_dimensions, options.aspect_ratio, options.zoom_percent)
+        base_video_filter = self.video_filter(options.aspect_ratio, options.zoom_percent)
+        overlay_tail_filters: list[str] = []
+        filters = [item for item in [base_video_filter] if item]
         temporary_text = []
         if self.settings.overlay_text_enabled:
-            overlay_filters, temporary_text = self.overlay_filters(destination, title, part, total_parts)
+            overlay_filters, temporary_text = self.overlay_filters(destination, title, part, total_parts, video_box)
+            overlay_tail_filters = overlay_filters
             filters.extend(overlay_filters)
-        if destination.is_file() and destination.stat().st_size > 0 and not filters:
-            return
-        command = [self.settings.media_binary("ffmpeg"), "-y", "-ss", str(start), "-i", str(source)]
+        speed_changed = abs(options.speed - 1.0) > 0.001
+        command = [self.settings.media_binary("ffmpeg"), "-y", "-ss", str(start)]
         if length is not None:
             command += ["-t", str(length)]
-        if filters:
-            command += ["-vf", ",".join(filters)]
+        command += ["-i", str(source)]
+        background = Path(options.background_path) if options.background_path else None
+        use_background = bool(background and background.is_file() and self.ASPECT_SIZES.get(options.aspect_ratio))
+        if destination.is_file() and destination.stat().st_size > 0 and not filters and not speed_changed and not use_background:
+            return
+        if use_background:
+            if background.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+                command += ["-loop", "1", "-i", str(background)]
+            else:
+                command += ["-stream_loop", "-1", "-i", str(background)]
+        if use_background:
+            command += ["-filter_complex", self.background_video_filter(options, overlay_tail_filters), "-map", "[v]", "-map", "0:a?"]
+        elif filters or speed_changed:
+            video_filters = []
+            if speed_changed:
+                video_filters.append(f"setpts=PTS/{options.speed:.6g}")
+            video_filters.extend(filters)
+            command += ["-vf", ",".join(video_filters)]
+        if speed_changed:
+            command += ["-af", self.audio_speed_filter(options.speed)]
         command += ["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", str(destination)]
         try:
             subprocess.run(command, capture_output=True, check=True, timeout=7200, **_hidden_subprocess_kwargs())
@@ -310,7 +575,8 @@ class ProcessHandler:
             for path in temporary_text:
                 path.unlink(missing_ok=True)
 
-    def overlay_filters(self, destination: Path, title: str, part: int, total_parts: int) -> tuple[list[str], list[Path]]:
+    def overlay_filters(self, destination: Path, title: str, part: int, total_parts: int,
+                        video_box: VideoBox | None = None) -> tuple[list[str], list[Path]]:
         font = Path(self.settings.overlay_font_path) if self.settings.overlay_font_path else Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arial.ttf"
         common = [
             f"fontcolor={self.settings.overlay_font_color}",
@@ -327,12 +593,14 @@ class ProcessHandler:
         wrapped = "\n".join(textwrap.wrap(title.strip(), width=36, break_long_words=False, break_on_hyphens=False)[:3]) or " "
         title_file.write_text(wrapped, encoding="utf-8")
         paths.append(title_file)
-        filters.append("drawtext=" + ":".join([f"textfile='{self.escape_filter_path(title_file)}'", *common, "x=(w-text_w)/2", "y=h*0.08"]))
+        title_y = f"max(24\\,{video_box.video_y}-text_h-24)" if video_box else "max(24\\,h*0.08)"
+        filters.append("drawtext=" + ":".join([f"textfile='{self.escape_filter_path(title_file)}'", *common, "x=(w-text_w)/2", f"y={title_y}"]))
         if total_parts > 1:
             part_file = destination.with_name(destination.stem + ".part.txt")
             part_file.write_text(f"Part {part}", encoding="utf-8")
             paths.append(part_file)
-            filters.append("drawtext=" + ":".join([f"textfile='{self.escape_filter_path(part_file)}'", *common, "x=(w-text_w)/2", "y=h-text_h-h*0.08"]))
+            part_y = f"min(h-text_h-24\\,{video_box.video_bottom}+24)" if video_box else "min(h-text_h-24\\,h-text_h-h*0.08)"
+            filters.append("drawtext=" + ":".join([f"textfile='{self.escape_filter_path(part_file)}'", *common, "x=(w-text_w)/2", f"y={part_y}"]))
         return filters, paths
 
     @staticmethod
@@ -340,15 +608,83 @@ class ProcessHandler:
         return path.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
 
     @classmethod
-    def video_filter(cls, aspect_ratio: str) -> str:
+    def video_filter(cls, aspect_ratio: str, zoom_percent: int = 100) -> str:
         size = cls.ASPECT_SIZES.get(aspect_ratio)
         if not size:
             return ""
         width, height = size
+        zoom = max(0, min(300, int(zoom_percent if zoom_percent is not None else 100))) / 100
+        target_width = max(2, int(width * zoom) // 2 * 2)
+        target_height = max(2, int(height * zoom) // 2 * 2)
+        if zoom <= 1.0:
+            return (
+                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+            )
         return (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+            f"crop=min(iw\\,{width}):min(ih\\,{height}):(iw-ow)/2:(ih-oh)/2,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         )
+
+    @classmethod
+    def scaled_video_box(cls, source_dimensions: tuple[int, int] | None, aspect_ratio: str,
+                         zoom_percent: int = 100) -> VideoBox | None:
+        size = cls.ASPECT_SIZES.get(aspect_ratio)
+        if not size or not source_dimensions:
+            return None
+        canvas_width, canvas_height = size
+        source_width, source_height = source_dimensions
+        if source_width <= 0 or source_height <= 0:
+            return None
+        zoom = max(0, min(300, int(zoom_percent if zoom_percent is not None else 100))) / 100
+        fit_width = max(2, int(canvas_width * zoom) // 2 * 2)
+        fit_height = max(2, int(canvas_height * zoom) // 2 * 2)
+        scale = min(fit_width / source_width, fit_height / source_height)
+        video_width = min(canvas_width, max(2, int(source_width * scale) // 2 * 2))
+        video_height = min(canvas_height, max(2, int(source_height * scale) // 2 * 2))
+        return VideoBox(
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+            video_width=video_width,
+            video_height=video_height,
+            video_x=(canvas_width - video_width) // 2,
+            video_y=(canvas_height - video_height) // 2,
+        )
+
+    @classmethod
+    def background_video_filter(cls, options: ProcessingOptions, tail_filters: list[str]) -> str:
+        width, height = cls.ASPECT_SIZES[options.aspect_ratio]
+        zoom = max(0, min(300, int(options.zoom_percent if options.zoom_percent is not None else 100))) / 100
+        target_width = max(2, int(width * zoom) // 2 * 2)
+        target_height = max(2, int(height * zoom) // 2 * 2)
+        source_filters = []
+        if abs(options.speed - 1.0) > 0.001:
+            source_filters.append(f"setpts=PTS/{options.speed:.6g}")
+        source_filters.append(f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease")
+        if zoom > 1.0:
+            source_filters.append(f"crop=min(iw\\,{width}):min(ih\\,{height}):(iw-ow)/2:(ih-oh)/2")
+        source_filters.append("setsar=1")
+        merged = (
+            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},setsar=1[bg];"
+            f"[0:v]{','.join(source_filters)}[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1"
+        )
+        if tail_filters:
+            merged += "," + ",".join(tail_filters)
+        return merged + "[v]"
+
+    @staticmethod
+    def audio_speed_filter(speed: float) -> str:
+        speed = max(0.25, min(4.0, float(speed or 1.0)))
+        parts: list[float] = []
+        while speed > 2.0:
+            parts.append(2.0); speed /= 2.0
+        while speed < 0.5:
+            parts.append(0.5); speed /= 0.5
+        parts.append(speed)
+        return ",".join(f"atempo={part:.6g}" for part in parts)
 
     def _route_uploads(self, media_id: int, caption: str) -> None:
         queued: list[tuple[int, int]] = []
@@ -370,11 +706,8 @@ class ProcessHandler:
             ).fetchall()
             if not account:
                 return
-            multiple_parts = len(artifacts) > 1
             for artifact in artifacts:
-                upload_caption = caption
-                if multiple_parts:
-                    upload_caption = f"{caption} - Part {artifact['segment_index'] or 1}"
+                upload_caption = self.normalize_hashtag_caption(account["hashtags"] or "")
                 connection.execute(
                     """INSERT INTO upload_tasks(media_item_id,artifact_id,account_id,caption) VALUES (?,?,?,?)
                     ON CONFLICT(artifact_id,account_id) DO UPDATE SET caption=excluded.caption""",
@@ -384,6 +717,19 @@ class ProcessHandler:
                 queued.append((int(task["id"]), media_id))
         for task_id, item_id in queued:
             self.db.enqueue("upload", item_id, f"upload:{task_id}", json.dumps({"task_id": task_id}))
+
+    @staticmethod
+    def normalize_hashtag_caption(value: str) -> str:
+        tags = []
+        for token in re.split(r"[\s,;]+", value or ""):
+            token = token.strip()
+            if not token:
+                continue
+            token = token if token.startswith("#") else "#" + token
+            token = re.sub(r"[^\w#\u00C0-\u1EF9]", "", token, flags=re.UNICODE)
+            if len(token) > 1 and token not in tags:
+                tags.append(token)
+        return " ".join(tags)
 
 
 class UploadHandler:
@@ -411,52 +757,203 @@ class UploadHandler:
             raise ManualAction("Tài khoản đã đạt giới hạn đăng trong ngày")
         if not self.settings.tiktok_publish_enabled:
             raise ManualAction("Đã xử lý xong; bật 'Cho phép đăng TikTok' để publish")
+        job_id = job["id"] if "id" in job.keys() else None
         mode = task["mode"] or "cdp"
         if mode == "gpm":
-            raise ManualAction("Tài khoản đang chọn chế độ GPM Automation. Cấu hình đã được lưu, nhưng adapter upload GPM chưa được triển khai production.")
-        self._playwright_upload(Path(task["path"]), task["caption"], task["endpoint"] or self.settings.tiktok_cdp_url)
+            cdp_url = self._start_gpm_profile(task["gpm_profile_id"], task["account_id"], job_id)
+        else:
+            cdp_url = task["endpoint"] or self.settings.tiktok_cdp_url
+        self._playwright_upload(
+            Path(task["path"]),
+            task["caption"],
+            cdp_url,
+            log=lambda message: self.db.event(job_id, "INFO", message),
+        )
         with self.db.connect() as connection:
             connection.execute("UPDATE upload_tasks SET status='completed',posted_at=? WHERE id=?", (utc_now(), task["id"]))
             connection.execute("UPDATE tiktok_accounts SET posts_today=posts_today+1,counter_date=?,status='idle' WHERE id=?", (today, task["account_id"]))
             connection.execute("UPDATE media_items SET status='uploaded',updated_at=? WHERE id=?", (utc_now(), task["media_item_id"]))
 
+    def _start_gpm_profile(self, profile_id: str, account_id: int, job_id: int | None = None) -> str:
+        if not profile_id:
+            raise ManualAction("Chế độ GPM cần GPM Profile ID cho kênh TikTok này")
+        try:
+            self.db.event(job_id, "INFO", f"GPM: đang mở profile {profile_id}")
+            if self.settings.gpm_reclaim_profile_in_use:
+                self.db.event(job_id, "INFO", "GPM: nếu profile đang mở nhưng không lấy được CDP, app sẽ đóng profile và mở lại")
+            cdp_url = GpmLoginClient(
+                self.settings.gpm_api_url,
+                reclaim_profile_in_use=self.settings.gpm_reclaim_profile_in_use,
+                event_callback=lambda message: self.db.event(job_id, "INFO", message),
+            ).start_profile(profile_id)
+        except ManualAction:
+            raise
+        except Exception as exc:
+            raise ManualAction(f"Không mở được GPM profile {profile_id}: {exc}") from exc
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE tiktok_accounts SET endpoint=?,status='uploading' WHERE id=?",
+                (cdp_url, account_id),
+            )
+        self.db.event(job_id, "INFO", f"GPM: profile {profile_id} đã sẵn sàng qua CDP {cdp_url}")
+        return cdp_url
+
     @staticmethod
-    def _playwright_upload(path: Path, caption: str, cdp_url: str) -> None:
+    def _playwright_upload(path: Path, caption: str, cdp_url: str, log: Callable[[str], None] | None = None) -> None:
         if not cdp_url:
             raise ManualAction("Chưa cấu hình CDP URL hoặc GPM profile cho TikTok")
+        normalized_cdp_url = GpmLoginClient._normalize_cdp_url(cdp_url) or cdp_url
+        emit = log or (lambda _message: None)
+        if normalized_cdp_url != cdp_url:
+            emit(f"TikTok: chuyển CDP local sang HTTP endpoint {normalized_cdp_url} để upload file lớn ổn định hơn")
+            cdp_url = normalized_cdp_url
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise RuntimeError("Thiếu dependency Playwright") from exc
         with sync_playwright() as playwright:
-            browser = playwright.chromium.connect_over_cdp(cdp_url)
+            emit("TikTok: đang kết nối Chrome/CDP")
+            browser = UploadHandler._connect_over_cdp_with_retry(playwright, cdp_url)
             if not browser.contexts:
                 raise ManualAction("Browser CDP không có context")
             context = browser.contexts[0]
             page = context.pages[0] if context.pages else context.new_page()
+            emit("TikTok: đang mở trang upload")
             page.goto("https://www.tiktok.com/upload?lang=en", wait_until="domcontentloaded")
+            emit("TikTok: đã mở trang upload")
             try:
-                UploadHandler._select_tiktok_upload_file(page, path, timeout=45_000)
+                UploadHandler._select_tiktok_upload_file(page, path, timeout=45_000, log=emit)
+            except ManualAction:
+                raise
             except Exception as exc:
-                raise ManualAction(UploadHandler._diagnose_tiktok_upload_page(page)) from exc
-            editor = page.locator('[contenteditable="true"][role="textbox"], [contenteditable="true"]').first
-            editor.wait_for(state="visible", timeout=20 * 60_000)
-            editor.click(); editor.press("Control+A"); editor.type(caption, delay=20)
+                diagnostic = UploadHandler._diagnose_tiktok_upload_page(page)
+                raise ManualAction(f"{exc}\n{diagnostic}") from exc
+            emit("TikTok: đang chờ ô caption/hashtag")
+            editor = UploadHandler._find_tiktok_caption_editor(page, timeout=20 * 60_000)
+            emit("TikTok: đã thấy ô caption, bắt đầu nhập hashtag")
+            UploadHandler._human_click(page, editor)
+            UploadHandler._fill_tiktok_caption(page, editor, caption, log=emit)
+            emit("TikTok: đã nhập hashtag, đang chờ nút Post")
             post = page.get_by_role("button", name=re.compile(r"^(Post|Đăng)$")).first
             post.wait_for(state="visible", timeout=20 * 60_000)
-            post.click()
+            emit("TikTok: đang bấm Post")
+            UploadHandler._human_click(page, post)
             UploadHandler._confirm_tiktok_post_if_needed(page)
             page.wait_for_url(re.compile(r"^(?!.*\/upload).*$"), timeout=20 * 60_000)
+            emit("TikTok: đăng video hoàn tất")
 
     @staticmethod
-    def _select_tiktok_upload_file(page, path: Path, timeout: int = 45_000) -> None:
-        """Select a video file using a direct file input or TikTok's select-video button."""
+    def _connect_over_cdp_with_retry(playwright, cdp_url: str, timeout: int = 60_000):
+        deadline = time.monotonic() + timeout / 1000
+        last_error: Exception | None = None
+        while True:
+            try:
+                return playwright.chromium.connect_over_cdp(cdp_url)
+            except Exception as exc:
+                last_error = exc
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(1)
+        raise last_error or RuntimeError(f"Không kết nối được CDP {cdp_url}")
+
+    @staticmethod
+    def _human_click(page, locator, timeout: int = 10_000) -> None:
+        """Click a DOM-selected element with visible mouse movement when possible."""
+        locator.wait_for(state="visible", timeout=timeout)
         try:
-            file_input = UploadHandler._find_tiktok_file_input(page, timeout=timeout)
-            file_input.set_input_files(str(path))
+            locator.scroll_into_view_if_needed(timeout=timeout)
+        except Exception:
+            pass
+        try:
+            box = locator.bounding_box(timeout=timeout)
+        except TypeError:
+            try:
+                box = locator.bounding_box()
+            except Exception:
+                box = None
+        except Exception:
+            box = None
+        if not box:
+            locator.click()
             return
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+        try:
+            page.mouse.move(x, y, steps=8)
+            page.wait_for_timeout(120)
+            page.mouse.click(x, y)
+        except Exception:
+            locator.click()
+
+    @staticmethod
+    def _fill_tiktok_caption(page, editor, caption: str, log: Callable[[str], None] | None = None) -> None:
+        emit = log or (lambda _message: None)
+        editor.press("Control+A")
+        editor.press("Backspace")
+        tags = re.findall(r"#[^\s#]+", caption or "")
+        if not tags:
+            emit("TikTok: không có hashtag để nhập")
+            return
+        for index, tag in enumerate(tags):
+            emit(f"TikTok: đang nhập hashtag {tag}")
+            editor.type(tag, delay=35)
+            if UploadHandler._select_first_hashtag_suggestion(page):
+                emit(f"TikTok: đã chọn hashtag {tag}")
+            else:
+                emit(f"TikTok: đã nhập hashtag {tag} nhưng không thấy popup gợi ý")
+            if index < len(tags) - 1:
+                editor.type(" ", delay=20)
+
+    @staticmethod
+    def _select_first_hashtag_suggestion(page, timeout: int = 5_000) -> bool:
+        candidates = []
+        for selector in (
+            '.mention-list-popover [role="option"].focused',
+            '.mention-list-popover [role="option"]',
+            '.hashtag-suggestion-item.focused',
+            '.hashtag-suggestion-item',
+            'xpath=//div[contains(@class,"mention-list-popover")]//*[@role="option"][1]',
+        ):
+            try:
+                candidates.append(page.locator(selector).first)
+            except Exception:
+                pass
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=timeout)
+                UploadHandler._human_click(page, candidate, timeout=timeout)
+                return True
+            except Exception:
+                continue
+        try:
+            page.keyboard.press("Enter")
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _select_tiktok_upload_file(page, path: Path, timeout: int = 45_000, log: Callable[[str], None] | None = None) -> None:
+        """Select a video file using a direct file input or TikTok's select-video button."""
+        emit = log or (lambda _message: None)
+        try:
+            emit("TikTok: đang tìm input[type=file]")
+            file_input = UploadHandler._find_tiktok_file_input(page, timeout=timeout)
+            emit("TikTok: đã tìm thấy input[type=file]")
         except Exception as first_error:
             last_error = first_error
+        else:
+            if path.is_absolute() and not path.is_file():
+                raise RuntimeError(f"TikTok: không tìm thấy file video trên máy để upload: {path}")
+            emit(f"TikTok: đang set file {path}")
+            try:
+                file_input.set_input_files(str(path))
+            except Exception as exc:
+                raise RuntimeError(f"TikTok: đã tìm thấy input[type=file] nhưng set file thất bại cho {path}: {exc}") from exc
+            emit(f"TikTok: đã set file {path.name}")
+            emit("TikTok: đang chờ form caption")
+            UploadHandler._wait_for_tiktok_upload_form(page, timeout=timeout)
+            emit("TikTok: đã thấy form caption/upload details")
+            return
         button_selectors = (
             'button[aria-label="Select video"]',
             'button:has-text("Select video")',
@@ -472,12 +969,84 @@ class UploadHandler:
                 button = page.locator(selector).first
                 button.wait_for(state="visible", timeout=min(10_000, remaining))
                 with page.expect_file_chooser(timeout=min(10_000, remaining)) as chooser:
-                    button.click()
+                    UploadHandler._human_click(page, button, timeout=min(10_000, remaining))
                 chooser.value.set_files(str(path))
+                emit(f"TikTok: đã set file {path.name} qua file chooser")
+                emit("TikTok: đang chờ form caption")
+                UploadHandler._wait_for_tiktok_upload_form(page, timeout=timeout)
+                emit("TikTok: đã thấy form caption/upload details")
                 return
             except Exception as exc:
                 last_error = exc
+                if UploadHandler._has_tiktok_upload_form(page, timeout=1_000):
+                    emit("TikTok: đã thấy form caption/upload details")
+                    return
         raise last_error
+
+    @staticmethod
+    def _wait_for_tiktok_upload_form(page, timeout: int = 45_000) -> bool:
+        """Wait until TikTok leaves the select-file state and shows the upload details form."""
+        deadline = time.time() + timeout / 1000
+        last_error = None
+        while time.time() < deadline:
+            if UploadHandler._has_tiktok_upload_form(page, timeout=1_000):
+                return True
+            try:
+                body_text = page.locator("body").inner_text(timeout=1_000)
+                if re.search(r"(Uploading|Processing|Đang tải|Đang xử lý|Caption|Description|Mô tả|Hashtag)", body_text, re.IGNORECASE):
+                    return True
+            except Exception as exc:
+                last_error = exc
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                time.sleep(0.5)
+        if last_error:
+            raise last_error
+        raise RuntimeError("TikTok đã nhận file nhưng chưa hiển thị form caption/upload details")
+
+    @staticmethod
+    def _has_tiktok_upload_form(page, timeout: int = 1_000) -> bool:
+        try:
+            UploadHandler._find_tiktok_caption_editor(page, timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _find_tiktok_caption_editor(page, timeout: int = 20 * 60_000):
+        selectors = (
+            '[contenteditable="true"][role="textbox"]',
+            '[contenteditable="true"][aria-label*="caption" i]',
+            '[contenteditable="true"][aria-label*="description" i]',
+            '[contenteditable="true"][data-e2e*="caption" i]',
+            '[contenteditable="true"]',
+            'textarea[placeholder*="caption" i]',
+            'textarea[placeholder*="description" i]',
+        )
+        deadline = time.time() + timeout / 1000
+        last_error = None
+        for selector in selectors:
+            try:
+                remaining = int(max(1_000, (deadline - time.time()) * 1000))
+                editor = page.locator(selector).first
+                editor.wait_for(state="visible", timeout=min(10_000, remaining))
+                return editor
+            except Exception as exc:
+                last_error = exc
+        for selector in ("iframe", 'iframe[src*="creator"]', 'iframe[src*="upload"]', 'iframe[src*="studio"]'):
+            try:
+                frame = page.frame_locator(selector).first
+                for editor_selector in selectors:
+                    remaining = int(max(1_000, (deadline - time.time()) * 1000))
+                    editor = frame.locator(editor_selector).first
+                    editor.wait_for(state="visible", timeout=min(10_000, remaining))
+                    return editor
+            except Exception as exc:
+                last_error = exc
+        if last_error:
+            raise last_error
+        raise RuntimeError("Không tìm thấy ô caption/description TikTok")
 
     @staticmethod
     def _find_tiktok_file_input(page, timeout: int = 45_000):
@@ -570,7 +1139,7 @@ class UploadHandler:
         for candidate in candidates:
             try:
                 candidate.wait_for(state="visible", timeout=3_000)
-                candidate.click()
+                UploadHandler._human_click(page, candidate, timeout=3_000)
                 return True
             except Exception:
                 continue
@@ -579,6 +1148,240 @@ class UploadHandler:
 
 class ManualAction(RuntimeError):
     pass
+
+
+class GpmLoginClient:
+    """Small adapter for GPM Login API v3.
+
+    GPM opens a real Chrome profile and returns a remote-debugging address.
+    The TikTok uploader then connects to that address through Playwright CDP.
+    """
+
+    def __init__(
+        self,
+        api_url: str,
+        timeout: int = 60,
+        reclaim_profile_in_use: bool = True,
+        reclaim_wait_seconds: float = 2.0,
+        event_callback: Callable[[str], None] | None = None,
+    ):
+        self.api_url = (api_url or DEFAULT_GPM_API_URL).strip().rstrip("/")
+        self.timeout = timeout
+        self.reclaim_profile_in_use = reclaim_profile_in_use
+        self.reclaim_wait_seconds = reclaim_wait_seconds
+        self.event_callback = event_callback
+
+    def start_profile(self, profile_id: str) -> str:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            raise ManualAction("GPM Profile ID đang trống")
+        quoted_profile_id = urllib.parse.quote(profile_id, safe="")
+        start_path = f"/profiles/start/{quoted_profile_id}"
+        response = self._get_json(start_path)
+        cdp_url = self._extract_cdp_url(response)
+        if cdp_url:
+            try:
+                return self._wait_for_cdp_endpoint(cdp_url)
+            except ManualAction as exc:
+                if self.reclaim_profile_in_use:
+                    self._event(f"GPM: CDP {cdp_url} chưa sẵn sàng, app sẽ đóng profile và mở lại")
+                    return self._reclaim_profile_and_start(profile_id, start_path, str(exc))
+                raise
+        if isinstance(response, dict) and response.get("success") is False:
+            message = response.get("message") or response.get("msg") or response.get("error") or "GPM API báo lỗi khi start profile"
+            if "ProfileInUse" in str(message):
+                running_cdp_url = self.find_running_profile_cdp(profile_id)
+                if running_cdp_url:
+                    return self._wait_for_cdp_endpoint(running_cdp_url)
+                if self.reclaim_profile_in_use:
+                    self._event("GPM: ProfileInUse, app đang đóng profile và mở lại")
+                    return self._reclaim_profile_and_start(profile_id, start_path, "ProfileInUse")
+                raise ManualAction(
+                    "GPM báo ProfileInUse: profile đang mở ở nơi khác nhưng app không tìm thấy CDP port để dùng lại. "
+                    "Hãy đóng profile trong GPM rồi chạy lại, bật option tự đóng/mở lại profile, hoặc mở profile với remote debugging/CDP và điền endpoint thủ công."
+                )
+            raise ManualAction(str(message))
+        raise ManualAction(
+            "GPM đã trả response nhưng không có remote_debugging_address/CDP endpoint. "
+            "Hãy kiểm tra GPM Login API URL và phiên bản GPM."
+        )
+
+    def _reclaim_profile_and_start(self, profile_id: str, start_path: str, reason: str = "") -> str:
+        self.stop_profile(profile_id)
+        self._event(f"GPM: đã gửi lệnh stop profile {profile_id}, đang mở lại")
+        if self.reclaim_wait_seconds > 0:
+            time.sleep(self.reclaim_wait_seconds)
+        retry_response = self._get_json(start_path)
+        retry_cdp_url = self._extract_cdp_url(retry_response)
+        if retry_cdp_url:
+            self._event(f"GPM: đã lấy CDP mới {retry_cdp_url}, đang chờ Chrome sẵn sàng")
+            return self._wait_for_cdp_endpoint(retry_cdp_url)
+        retry_message = ""
+        if isinstance(retry_response, dict):
+            retry_message = str(retry_response.get("message") or retry_response.get("msg") or retry_response.get("error") or "")
+        raise ManualAction(
+            "GPM cần reclaim profile nhưng sau khi đóng/mở lại vẫn không lấy được CDP endpoint. "
+            f"Lý do ban đầu: {reason}. Phản hồi GPM sau khi mở lại: {retry_message or retry_response}"
+        )
+
+    def _event(self, message: str) -> None:
+        if self.event_callback:
+            try:
+                self.event_callback(message)
+            except Exception:
+                LOGGER.exception("Could not write GPM event")
+
+    def _get_json(self, path: str) -> object:
+        url = self.api_url + path
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            raise ManualAction(f"Không gọi được GPM API tại {url}. Hãy mở GPM Login và kiểm tra GPM API URL. Chi tiết: {exc}") from exc
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ManualAction(f"GPM API trả dữ liệu không phải JSON tại {url}: {raw[:300]}") from exc
+
+    def stop_profile(self, profile_id: str) -> object:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            raise ManualAction("GPM Profile ID đang trống")
+        response = self._get_json(f"/profiles/stop/{urllib.parse.quote(profile_id, safe='')}")
+        if isinstance(response, dict) and response.get("success") is False:
+            message = response.get("message") or response.get("msg") or response.get("error") or "GPM API báo lỗi khi stop profile"
+            if str(message).strip().lower() in {"ok", "success", "successful", "profile stopped", "stopped"}:
+                return response
+            raise ManualAction(f"Không đóng được GPM profile {profile_id}: {message}")
+        return response
+
+    @classmethod
+    def _extract_cdp_url(cls, payload: object) -> str:
+        candidates: list[object] = []
+        if isinstance(payload, dict):
+            candidates.append(payload)
+            data = payload.get("data")
+            if isinstance(data, dict):
+                candidates.append(data)
+            elif isinstance(data, list):
+                candidates.extend(item for item in data if isinstance(item, dict))
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            for key in (
+                "remote_debugging_address",
+                "remoteDebuggingAddress",
+                "debugging_address",
+                "debuggerAddress",
+                "cdp_url",
+                "cdpUrl",
+                "endpoint",
+                "browser_endpoint",
+                "browserWSEndpoint",
+                "wsEndpoint",
+                "websocket_debugging_url",
+                "websocketDebuggingUrl",
+                "webSocketDebuggerUrl",
+            ):
+                value = item.get(key)
+                cdp_url = cls._normalize_cdp_url(value)
+                if cdp_url:
+                    return cdp_url
+            port = item.get("remote_debugging_port") or item.get("remoteDebuggingPort") or item.get("debugging_port") or item.get("port")
+            if port:
+                host = item.get("host") or item.get("ip") or "127.0.0.1"
+                cdp_url = cls._normalize_cdp_url(f"{host}:{port}")
+                if cdp_url:
+                    return cdp_url
+        return ""
+
+    @staticmethod
+    def _normalize_cdp_url(value: object) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip().strip('"').strip("'")
+        if not text:
+            return ""
+        if text.startswith(("ws://", "wss://")):
+            try:
+                parsed = urllib.parse.urlparse(text)
+                host = (parsed.hostname or "").lower()
+                if parsed.port and host in {"localhost", "127.0.0.1", "::1"}:
+                    return f"http://127.0.0.1:{parsed.port}"
+            except Exception:
+                pass
+            return text
+        if text.startswith(("http://", "https://")):
+            return text
+        if re.fullmatch(r"\d{2,5}", text):
+            return f"http://127.0.0.1:{text}"
+        if re.fullmatch(r"[^/:]+:\d{2,5}", text):
+            return f"http://{text}"
+        return ""
+
+    def _wait_for_cdp_endpoint(self, cdp_url: str, timeout: int = 60) -> str:
+        if cdp_url.startswith(("ws://", "wss://")):
+            return cdp_url
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._is_cdp_alive(cdp_url):
+                return cdp_url
+            time.sleep(1)
+        raise ManualAction(
+            f"GPM đã trả CDP {cdp_url} nhưng Chrome chưa mở cổng remote debugging sau {timeout}s. "
+            "Hãy kiểm tra profile GPM có bật remote debugging và thử đóng/mở lại profile."
+        )
+
+    @classmethod
+    def find_running_profile_cdp(cls, profile_id: str) -> str:
+        """Best-effort Windows fallback for GPM versions that return ProfileInUse.
+
+        Recent GPM API versions are documented to return the cached CDP endpoint
+        when a profile is already running. Some local installs instead return
+        ProfileInUse. In that case we inspect local Chrome process command lines,
+        match the GPM profile id, and reuse its --remote-debugging-port.
+        """
+        if os.name != "nt" or not profile_id:
+            return ""
+        powershell = Path(os.environ.get("WINDIR", "C:/Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        command = (
+            "$profileId=$args[0]; "
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profileId) -and $_.CommandLine -match '--remote-debugging-port[= ](\\d+)' } | "
+            "Select-Object -First 1 -ExpandProperty CommandLine"
+        )
+        try:
+            result = subprocess.run(
+                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command, profile_id],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                **_hidden_subprocess_kwargs(),
+            )
+        except Exception:
+            LOGGER.exception("Could not inspect running GPM/Chrome process for profile=%s", profile_id)
+            return ""
+        if result.returncode != 0:
+            LOGGER.warning("Inspect running GPM profile failed: %s", (result.stderr or result.stdout or "").strip()[:500])
+            return ""
+        match = re.search(r"--remote-debugging-port[= ](\d+)", result.stdout or "")
+        if not match:
+            return ""
+        cdp_url = f"http://127.0.0.1:{match.group(1)}"
+        if cls._is_cdp_alive(cdp_url):
+            return cdp_url
+        LOGGER.warning("Found running GPM CDP port but /json/version did not respond: %s", cdp_url)
+        return ""
+
+    @staticmethod
+    def _is_cdp_alive(cdp_url: str) -> bool:
+        try:
+            with urllib.request.urlopen(cdp_url.rstrip("/") + "/json/version", timeout=3) as response:
+                return 200 <= response.status < 300
+        except Exception:
+            return False
 
 
 class PipelineOrchestrator:

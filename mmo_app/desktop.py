@@ -5,9 +5,12 @@ import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
+from datetime import datetime, timezone
 
 from .application import Application
 from .reporting import export_pipeline_report
+from .services import GpmLoginClient
+from .settings import DEFAULT_GPM_API_URL
 
 
 class Desktop(tk.Tk):
@@ -19,6 +22,7 @@ class Desktop(tk.Tk):
         self.minsize(900, 560)
         self.protocol("WM_DELETE_WINDOW", self.withdraw)
         self._build()
+        self._last_events_text = ""
         self._start_tray()
         self.runtime_status.configure(text="● Chưa chạy — hãy nhập/lưu cấu hình rồi bấm Bắt đầu")
         self.start_button.configure(state="normal")
@@ -100,14 +104,18 @@ class Desktop(tk.Tk):
             "rss_interval_seconds": tk.StringVar(value=str(settings.rss_interval_seconds)),
             "download_dir": tk.StringVar(value=settings.download_dir),
             "output_dir": tk.StringVar(value=settings.output_dir),
-            "segment_seconds": tk.StringVar(value=str(settings.segment_seconds)),
             "output_aspect_ratio": tk.StringVar(value=settings.output_aspect_ratio),
+            "video_zoom_factor": tk.DoubleVar(value=max(0.0, min(3.0, (settings.video_zoom_percent if settings.video_zoom_percent is not None else 100) / 100))),
+            "video_zoom_label": tk.StringVar(value=""),
+            "video_speed": tk.StringVar(value=str(settings.video_speed)),
+            "source_orientation_filter": tk.StringVar(value=settings.source_orientation_filter),
             "overlay_text_enabled": tk.BooleanVar(value=settings.overlay_text_enabled),
             "overlay_font_path": tk.StringVar(value=settings.overlay_font_path),
             "overlay_font_color": tk.StringVar(value=settings.overlay_font_color),
             "overlay_font_size": tk.StringVar(value=str(settings.overlay_font_size)),
             "tiktok_publish_enabled": tk.BooleanVar(value=settings.tiktok_publish_enabled),
             "gpm_api_url": tk.StringVar(value=settings.gpm_api_url),
+            "gpm_reclaim_profile_in_use": tk.BooleanVar(value=settings.gpm_reclaim_profile_in_use),
         }
         fields = [
             ("Public domain HTTPS (Cloudflare Tunnel)", "public_domain"),
@@ -115,7 +123,7 @@ class Desktop(tk.Tk):
             ("WebSub port", "webhook_port"),
             ("RSS fallback interval (giây)", "rss_interval_seconds"),
             ("Thư mục tải video", "download_dir"), ("Thư mục video đã xử lý", "output_dir"),
-            ("Thời lượng mỗi đoạn (giây)", "segment_seconds"),
+            ("Speed toàn app", "video_speed"),
             ("GPM API URL", "gpm_api_url"),
             ("Font chữ (.ttf/.otf, bỏ trống dùng Arial)", "overlay_font_path"),
             ("Màu chữ (white hoặc #RRGGBB)", "overlay_font_color"),
@@ -127,7 +135,34 @@ class Desktop(tk.Tk):
             row = offset
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=7)
             ttk.Entry(form, textvariable=self.variables[key], width=85).grid(row=row, column=1, sticky="ew", padx=4, pady=7)
-        ratio_row = len(fields) + 1
+        zoom_row = len(fields) + 1
+        ttk.Label(form, text="Zoom video toàn app").grid(row=zoom_row, column=0, sticky="w", padx=4, pady=7)
+        zoom_frame = ttk.Frame(form)
+        zoom_frame.grid(row=zoom_row, column=1, sticky="ew", padx=4, pady=7)
+        ttk.Scale(
+            zoom_frame,
+            from_=0,
+            to=3,
+            orient="horizontal",
+            variable=self.variables["video_zoom_factor"],
+            command=lambda _value: self._update_zoom_label(),
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Label(zoom_frame, textvariable=self.variables["video_zoom_label"], width=16).pack(side="left", padx=(10, 0))
+        self._update_zoom_label()
+        orientation_row = zoom_row + 1
+        ttk.Label(form, text="Lọc hướng video tải về").grid(row=orientation_row, column=0, sticky="w", padx=4, pady=7)
+        ttk.Combobox(
+            form,
+            textvariable=self.variables["source_orientation_filter"],
+            values=("both", "landscape", "portrait"),
+            state="readonly",
+            width=18,
+        ).grid(row=orientation_row, column=1, sticky="w", padx=4, pady=7)
+        ttk.Label(
+            form,
+            text="both = tải cả ngang/dọc, landscape = chỉ video ngang, portrait = chỉ video dọc",
+        ).grid(row=orientation_row + 1, column=1, sticky="w", padx=4, pady=(0, 7))
+        ratio_row = orientation_row + 2
         ttk.Label(form, text="Tỷ lệ video đầu ra").grid(row=ratio_row, column=0, sticky="w", padx=4, pady=7)
         ttk.Combobox(
             form,
@@ -139,9 +174,10 @@ class Desktop(tk.Tk):
         controls_row = ratio_row + 1
         ttk.Checkbutton(form, text="Chèn title phía trên và Part phía dưới video", variable=self.variables["overlay_text_enabled"]).grid(row=controls_row, column=1, sticky="w", padx=4, pady=7)
         ttk.Checkbutton(form, text="Cho phép click Đăng TikTok (tác vụ có tác động công khai)", variable=self.variables["tiktok_publish_enabled"]).grid(row=controls_row + 1, column=1, sticky="w", padx=4, pady=7)
-        ttk.Button(form, text="Chọn font…", command=self._choose_font).grid(row=controls_row + 2, column=0, sticky="w", padx=4, pady=10)
-        ttk.Button(form, text="Lưu cấu hình", command=self._save_settings).grid(row=controls_row + 2, column=1, sticky="w", padx=4, pady=10)
-        ttk.Button(form, text="Mở thư mục dữ liệu", command=lambda: os.startfile(settings.data_dir)).grid(row=controls_row + 2, column=1, sticky="e", padx=4, pady=10)
+        ttk.Checkbutton(form, text="GPM ProfileInUse: tự đóng profile và mở lại bằng app", variable=self.variables["gpm_reclaim_profile_in_use"]).grid(row=controls_row + 2, column=1, sticky="w", padx=4, pady=7)
+        ttk.Button(form, text="Chọn font…", command=self._choose_font).grid(row=controls_row + 3, column=0, sticky="w", padx=4, pady=10)
+        ttk.Button(form, text="Lưu cấu hình", command=self._save_settings).grid(row=controls_row + 3, column=1, sticky="w", padx=4, pady=10)
+        ttk.Button(form, text="Mở thư mục dữ liệu", command=lambda: os.startfile(settings.data_dir)).grid(row=controls_row + 3, column=1, sticky="e", padx=4, pady=10)
         form.columnconfigure(1, weight=1)
 
     def _save_settings(self) -> None:
@@ -162,9 +198,13 @@ class Desktop(tk.Tk):
                 raise ValueError("Public domain WebSub phải bắt đầu bằng https://")
             value.download_dir = self.variables["download_dir"].get().strip()
             value.output_dir = self.variables["output_dir"].get().strip()
-            value.segment_seconds = max(5, int(self.variables["segment_seconds"].get()))
+            zoom_factor = max(0.0, min(3.0, float(self.variables["video_zoom_factor"].get())))
+            value.video_zoom_percent = int(round(zoom_factor * 100))
+            value.video_speed = max(0.25, min(4.0, float(self.variables["video_speed"].get())))
+            value.source_orientation_filter = self.variables["source_orientation_filter"].get()
             value.output_aspect_ratio = self.variables["output_aspect_ratio"].get()
-            value.gpm_api_url = self.variables["gpm_api_url"].get().strip() or "http://127.0.0.1:19995/api/v3"
+            value.gpm_api_url = self.variables["gpm_api_url"].get().strip() or DEFAULT_GPM_API_URL
+            value.gpm_reclaim_profile_in_use = bool(self.variables["gpm_reclaim_profile_in_use"].get())
             value.overlay_text_enabled = bool(self.variables["overlay_text_enabled"].get())
             value.overlay_font_path = self.variables["overlay_font_path"].get().strip()
             if value.overlay_font_path and not os.path.isfile(value.overlay_font_path):
@@ -184,6 +224,10 @@ class Desktop(tk.Tk):
         path = filedialog.askopenfilename(title="Chọn font chữ", filetypes=[("Font", "*.ttf *.otf"), ("Tất cả file", "*.*")])
         if path: self.variables["overlay_font_path"].set(path)
 
+    def _update_zoom_label(self) -> None:
+        factor = max(0.0, min(3.0, float(self.variables["video_zoom_factor"].get())))
+        self.variables["video_zoom_label"].set(f"{factor:.2f}x ({int(round(factor * 100))}%)")
+
     def _build_routes(self) -> None:
         header = ttk.Frame(self.routes_tab)
         header.pack(fill="x", pady=(0, 8))
@@ -202,13 +246,14 @@ class Desktop(tk.Tk):
         self.loaded_route_ids = set()
         with self.application.database.connect() as connection:
             rows = connection.execute(
-                """SELECT r.id,r.name,r.account_id,a.name account_name,a.mode,a.endpoint,a.gpm_profile_id,a.daily_limit
+                """SELECT r.id,r.name,r.account_id,a.name account_name,a.mode,a.endpoint,a.gpm_profile_id,a.daily_limit,a.hashtags
                 FROM channel_routes r JOIN tiktok_accounts a ON a.id=r.account_id
                 WHERE r.active=1 ORDER BY r.id"""
             ).fetchall()
             for row in rows:
-                urls = [item["source_url"] for item in connection.execute(
-                    "SELECT source_url FROM channel_route_sources WHERE route_id=? ORDER BY rowid", (row["id"],)
+                urls = [dict(item) for item in connection.execute(
+                    """SELECT source_url,segment_seconds,background_path
+                    FROM channel_route_sources WHERE route_id=? ORDER BY rowid""", (row["id"],)
                 ).fetchall()]
                 self._add_route(dict(row), urls)
         if not self.route_cards:
@@ -228,6 +273,7 @@ class Desktop(tk.Tk):
         route["endpoint"] = tk.StringVar(value=data.get("endpoint") or "")
         route["gpm_profile_id"] = tk.StringVar(value=data.get("gpm_profile_id") or "")
         route["daily_limit"] = tk.StringVar(value=str(data.get("daily_limit") if data.get("daily_limit") is not None else 3))
+        route["hashtags"] = tk.StringVar(value=data.get("hashtags") or "")
         ttk.Label(card, text="Tên layout").grid(row=0, column=0, sticky="w"); ttk.Entry(card, textvariable=route["name"], width=24).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Label(card, text="Kênh TikTok").grid(row=0, column=2, sticky="w"); ttk.Entry(card, textvariable=route["account_name"], width=24).grid(row=0, column=3, sticky="ew", padx=6)
         ttk.Button(card, text="Xóa layout", command=lambda: self._remove_route(route)).grid(row=0, column=4, padx=4)
@@ -235,31 +281,89 @@ class Desktop(tk.Tk):
         ttk.Combobox(card, textvariable=route["mode"], values=("cdp", "gpm"), state="readonly", width=18).grid(row=1, column=1, sticky="w", padx=6, pady=7)
         ttk.Label(card, text="cdp = Chrome CDP/Playwright, gpm = GPM Automation").grid(row=1, column=2, columnspan=3, sticky="w", padx=6)
         ttk.Label(card, text="TikTok Chrome CDP URL").grid(row=2, column=0, sticky="w", pady=7); ttk.Entry(card, textvariable=route["endpoint"]).grid(row=2, column=1, columnspan=4, sticky="ew", padx=6)
-        ttk.Label(card, text="GPM Profile ID").grid(row=3, column=0, sticky="w", pady=7); ttk.Entry(card, textvariable=route["gpm_profile_id"]).grid(row=3, column=1, columnspan=4, sticky="ew", padx=6)
+        ttk.Label(card, text="GPM Profile ID").grid(row=3, column=0, sticky="w", pady=7); ttk.Entry(card, textvariable=route["gpm_profile_id"]).grid(row=3, column=1, columnspan=3, sticky="ew", padx=6)
+        ttk.Button(card, text="Test GPM", command=lambda: self._test_gpm_route(route)).grid(row=3, column=4, padx=4)
         ttk.Label(card, text="Giới hạn đăng/ngày").grid(row=4, column=0, sticky="w", pady=7)
         ttk.Entry(card, textvariable=route["daily_limit"], width=10).grid(row=4, column=1, sticky="w", padx=6, pady=7)
         ttk.Label(card, text="0 = không giới hạn").grid(row=4, column=2, columnspan=3, sticky="w", padx=6)
-        ttk.Label(card, text="Nguồn YouTube").grid(row=5, column=0, sticky="nw", pady=5)
-        route["source_frame"] = ttk.Frame(card); route["source_frame"].grid(row=5, column=1, columnspan=4, sticky="ew")
+        ttk.Label(card, text="Hashtag TikTok").grid(row=5, column=0, sticky="w", pady=7)
+        ttk.Entry(card, textvariable=route["hashtags"]).grid(row=5, column=1, columnspan=4, sticky="ew", padx=6, pady=7)
+        ttk.Label(card, text="Caption upload chỉ dùng hashtag, ví dụ: #review #viral #tiktok").grid(row=6, column=1, columnspan=4, sticky="w", padx=6)
+        ttk.Label(card, text="Nguồn YouTube").grid(row=7, column=0, sticky="nw", pady=5)
+        route["source_frame"] = ttk.Frame(card); route["source_frame"].grid(row=7, column=1, columnspan=4, sticky="ew")
         for url in urls: self._add_source(route, url)
-        ttk.Button(card, text="＋ YouTube", command=lambda: self._add_source(route)).grid(row=6, column=1, sticky="w", pady=6)
+        ttk.Button(card, text="＋ YouTube", command=lambda: self._add_source(route)).grid(row=8, column=1, sticky="w", pady=6)
         for column in (1, 3): card.columnconfigure(column, weight=1)
         self.route_cards.append(route)
 
     def _add_source(self, route, url="") -> None:
-        row = ttk.Frame(route["source_frame"]); row.pack(fill="x", pady=2)
-        variable = tk.StringVar(value=url)
-        ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True)
-        source = {"frame": row, "url": variable}; route["sources"].append(source)
-        ttk.Button(row, text="−", width=3, command=lambda: self._remove_source(route, source)).pack(side="right", padx=(5, 0))
+        data = url if isinstance(url, dict) else {"source_url": url}
+        row = ttk.LabelFrame(route["source_frame"], text=f"YouTube {len(route['sources']) + 1}", padding=6)
+        row.pack(fill="x", pady=4)
+        variable = tk.StringVar(value=data.get("source_url") or "")
+        segment_seconds = tk.StringVar(value=str(data.get("segment_seconds") or self.application.settings.segment_seconds))
+        background_path = tk.StringVar(value=data.get("background_path") or "")
+        ttk.Label(row, text="URL kênh").grid(row=0, column=0, sticky="w")
+        ttk.Entry(row, textvariable=variable).grid(row=0, column=1, columnspan=5, sticky="ew", padx=5, pady=2)
+        ttk.Label(row, text="Đoạn (giây)").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(row, textvariable=segment_seconds, width=10).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(row, text="Zoom, Speed và lọc hướng video dùng chung trong tab Cấu hình").grid(row=1, column=2, columnspan=4, sticky="w", padx=5, pady=2)
+        ttk.Label(row, text="Background").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(row, textvariable=background_path).grid(row=2, column=1, columnspan=4, sticky="ew", padx=5)
+        source = {
+            "frame": row,
+            "url": variable,
+            "segment_seconds": segment_seconds,
+            "background_path": background_path,
+        }
+        ttk.Button(row, text="Chọn…", command=lambda: self._choose_source_background(source)).grid(row=2, column=5, sticky="w", padx=5)
+        ttk.Button(row, text="− Xóa YouTube", command=lambda: self._remove_source(route, source)).grid(row=3, column=1, sticky="w", padx=5, pady=4)
+        row.columnconfigure(1, weight=1)
+        row.columnconfigure(4, weight=1)
+        route["sources"].append(source)
 
     def _remove_source(self, route, source) -> None:
         if len(route["sources"]) <= 1:
             source["url"].set(""); return
         source["frame"].destroy(); route["sources"].remove(source)
 
+    def _choose_source_background(self, source) -> None:
+        path = filedialog.askopenfilename(
+            title="Chọn background theo kênh YouTube",
+            filetypes=[
+                ("Video / Image", "*.mp4 *.mov *.mkv *.webm *.jpg *.jpeg *.png *.webp *.bmp"),
+                ("Tất cả file", "*.*"),
+            ],
+        )
+        if path:
+            source["background_path"].set(path)
+
     def _remove_route(self, route) -> None:
         route["frame"].destroy(); self.route_cards.remove(route)
+
+    def _test_gpm_route(self, route) -> None:
+        profile_id = route["gpm_profile_id"].get().strip()
+        api_url = self.variables["gpm_api_url"].get().strip() or self.application.settings.gpm_api_url
+        if not profile_id:
+            messagebox.showwarning("Thiếu GPM Profile ID", "Hãy nhập GPM Profile ID cho layout này trước.")
+            return
+        self.runtime_status.configure(text=f"● Đang test GPM profile {profile_id}…")
+
+        def worker():
+            try:
+                cdp_url = GpmLoginClient(
+                    api_url,
+                    reclaim_profile_in_use=bool(self.variables["gpm_reclaim_profile_in_use"].get()),
+                ).start_profile(profile_id)
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Test GPM thất bại", str(exc)))
+                self.after(0, lambda: self.runtime_status.configure(text="● Test GPM thất bại"))
+                return
+            self.after(0, lambda: route["endpoint"].set(cdp_url))
+            self.after(0, lambda: messagebox.showinfo("Test GPM thành công", f"Profile đã mở.\nCDP URL:\n{cdp_url}"))
+            self.after(0, lambda: self.runtime_status.configure(text="● Test GPM thành công"))
+
+        threading.Thread(target=worker, name="test-gpm-profile", daemon=True).start()
 
     def _save_routes(self):
         if not self.route_cards:
@@ -271,37 +375,55 @@ class Desktop(tk.Tk):
             mode = route["mode"].get().strip() or "cdp"
             endpoint = route["endpoint"].get().strip()
             gpm_profile_id = route["gpm_profile_id"].get().strip()
+            hashtags = route["hashtags"].get().strip()
             try:
                 daily_limit = int(route["daily_limit"].get().strip() or "0")
             except ValueError as exc:
                 raise ValueError(f"{name}: giới hạn đăng/ngày phải là số nguyên") from exc
-            urls = [item["url"].get().strip() for item in route["sources"] if item["url"].get().strip()]
+            sources = []
+            for source in route["sources"]:
+                url = source["url"].get().strip()
+                if not url:
+                    continue
+                try:
+                    segment_seconds = int(source["segment_seconds"].get().strip() or str(self.application.settings.segment_seconds))
+                except ValueError as exc:
+                    raise ValueError(f"{name}: thời lượng mỗi đoạn của YouTube không hợp lệ") from exc
+                background_path = source["background_path"].get().strip()
+                if segment_seconds < 5: raise ValueError(f"{name}: thời lượng mỗi đoạn của YouTube phải >= 5 giây")
+                if background_path and not os.path.isfile(background_path):
+                    raise ValueError(f"{name}: không tìm thấy background {background_path}")
+                sources.append((url, segment_seconds, background_path))
             if not account_name: raise ValueError(f"{name}: chưa nhập tên kênh TikTok")
-            if not urls: raise ValueError(f"{name}: cần ít nhất một URL YouTube")
+            if not sources: raise ValueError(f"{name}: cần ít nhất một URL YouTube")
             if mode not in {"cdp", "gpm"}: raise ValueError(f"{name}: chế độ upload không hợp lệ")
             if daily_limit < 0: raise ValueError(f"{name}: giới hạn đăng/ngày không được âm")
             if mode == "cdp" and not endpoint: raise ValueError(f"{name}: chế độ cdp cần TikTok Chrome CDP URL")
             if mode == "gpm" and not gpm_profile_id: raise ValueError(f"{name}: chế độ gpm cần GPM Profile ID")
-            resolved = self.application.youtube.resolve_channel_urls(urls)
-            duplicate = next((item[0] for item in resolved if item[0] in used), None)
+            resolved_sources = []
+            for url, segment_seconds, background_path in sources:
+                channel_id, title, normalized_url = self.application.youtube.resolve_channel_url(url)
+                resolved_sources.append((channel_id, title, normalized_url, segment_seconds, background_path))
+            duplicate = next((item[0] for item in resolved_sources if item[0] in used), None)
             if duplicate: raise ValueError(f"Kênh YouTube {duplicate} đang nằm trong nhiều layout")
-            used.update(item[0] for item in resolved); all_resolved.extend(resolved)
-            prepared.append((route, name, account_name, mode, endpoint, gpm_profile_id, daily_limit, resolved))
+            used.update(item[0] for item in resolved_sources)
+            all_resolved.extend((item[0], item[1], item[2]) for item in resolved_sources)
+            prepared.append((route, name, account_name, mode, endpoint, gpm_profile_id, daily_limit, hashtags, resolved_sources))
         self.application.youtube.sync_channels(all_resolved)
         active_ids = []
         with self.application.database.connect() as connection:
             connection.execute("DELETE FROM channel_route_sources")
-            for route, name, account_name, mode, endpoint, gpm_profile_id, daily_limit, resolved in prepared:
+            for route, name, account_name, mode, endpoint, gpm_profile_id, daily_limit, hashtags, resolved in prepared:
                 if route["account_id"]:
                     connection.execute(
-                        "UPDATE tiktok_accounts SET name=?,mode=?,endpoint=?,gpm_profile_id=?,daily_limit=?,active=1 WHERE id=?",
-                        (account_name, mode, endpoint, gpm_profile_id, daily_limit, route["account_id"]),
+                        "UPDATE tiktok_accounts SET name=?,mode=?,endpoint=?,gpm_profile_id=?,daily_limit=?,hashtags=?,active=1 WHERE id=?",
+                        (account_name, mode, endpoint, gpm_profile_id, daily_limit, hashtags, route["account_id"]),
                     )
                     account_id = route["account_id"]
                 else:
                     account_id = connection.execute(
-                        "INSERT INTO tiktok_accounts(name,mode,endpoint,gpm_profile_id,daily_limit) VALUES (?,?,?,?,?)",
-                        (account_name, mode, endpoint, gpm_profile_id, daily_limit),
+                        "INSERT INTO tiktok_accounts(name,mode,endpoint,gpm_profile_id,daily_limit,hashtags) VALUES (?,?,?,?,?,?)",
+                        (account_name, mode, endpoint, gpm_profile_id, daily_limit, hashtags),
                     ).lastrowid
                     route["account_id"] = account_id
                 if route["id"]:
@@ -309,8 +431,12 @@ class Desktop(tk.Tk):
                 else:
                     route_id = connection.execute("INSERT INTO channel_routes(name,account_id) VALUES (?,?)", (name, account_id)).lastrowid; route["id"] = route_id
                 active_ids.append(route_id)
-                for channel_id, _title, url in resolved:
-                    connection.execute("INSERT INTO channel_route_sources(route_id,channel_id,source_url) VALUES (?,?,?)", (route_id, channel_id, url))
+                for channel_id, _title, url, segment_seconds, background_path in resolved:
+                    connection.execute(
+                        """INSERT INTO channel_route_sources(route_id,channel_id,source_url,segment_seconds,background_path)
+                        VALUES (?,?,?,?,?)""",
+                        (route_id, channel_id, url, segment_seconds, background_path),
+                    )
             removed = self.loaded_route_ids - set(active_ids)
             for route_id in removed: connection.execute("UPDATE channel_routes SET active=0 WHERE id=?", (route_id,))
         self.loaded_route_ids = set(active_ids)
@@ -340,9 +466,40 @@ class Desktop(tk.Tk):
         self.jobs.delete(*self.jobs.get_children())
         for row in rows:
             self.jobs.insert("", "end", values=(row["id"], row["title"], row["media_item_id"], row["kind"], row["status"], row["attempts"], row["error_message"] or ""))
-        text = "\n".join(f"{row['created_at']} | {row['level']:<7} | job={row['job_id']} | {row['message']}" for row in reversed(events))
-        self.events.configure(state="normal"); self.events.delete("1.0", "end"); self.events.insert("1.0", text); self.events.configure(state="disabled")
+        text = "\n".join(
+            f"{self.format_log_time(row['created_at'])} | {row['level']:<7} | job={row['job_id'] or '-'} | {row['message']}"
+            for row in reversed(events)
+        )
+        if text != self._last_events_text:
+            first, last = self.events.yview()
+            stick_to_bottom = last >= 0.98
+            self.events.configure(state="normal")
+            self.events.delete("1.0", "end")
+            self.events.insert("1.0", text)
+            self.events.configure(state="disabled")
+            if stick_to_bottom:
+                self.events.see("end")
+            else:
+                self.events.yview_moveto(first)
+            self._last_events_text = text
         self.after(2000, self._refresh)
+
+    @staticmethod
+    def format_log_time(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            if text.endswith("Z"):
+                parsed = datetime.fromisoformat(text[:-1] + "+00:00")
+            else:
+                parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            local = parsed.astimezone()
+            return local.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return text
 
     def _start(self) -> None:
         try:

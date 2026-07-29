@@ -27,13 +27,16 @@ CREATE TABLE IF NOT EXISTS job_events(
 CREATE TABLE IF NOT EXISTS tiktok_accounts(
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'cdp', endpoint TEXT,
  gpm_profile_id TEXT, active INTEGER NOT NULL DEFAULT 1, daily_limit INTEGER NOT NULL DEFAULT 3,
- posts_today INTEGER NOT NULL DEFAULT 0, counter_date TEXT, status TEXT NOT NULL DEFAULT 'idle');
+ posts_today INTEGER NOT NULL DEFAULT 0, counter_date TEXT, status TEXT NOT NULL DEFAULT 'idle',
+ hashtags TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS channel_routes(
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, account_id INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
  FOREIGN KEY(account_id) REFERENCES tiktok_accounts(id));
 CREATE TABLE IF NOT EXISTS channel_route_sources(
  route_id INTEGER NOT NULL, channel_id TEXT NOT NULL, source_url TEXT NOT NULL,
+ segment_seconds INTEGER, zoom_percent INTEGER NOT NULL DEFAULT 100, speed REAL NOT NULL DEFAULT 1.0,
+ background_path TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(route_id,channel_id), UNIQUE(channel_id),
  FOREIGN KEY(route_id) REFERENCES channel_routes(id) ON DELETE CASCADE,
  FOREIGN KEY(channel_id) REFERENCES channels(channel_id));

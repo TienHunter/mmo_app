@@ -121,6 +121,7 @@ mmo_app\settings.py
 - TikTok CDP URL mặc định;
 - cờ `tiktok_publish_enabled`;
 - tỷ lệ video đầu ra;
+- default zoom/speed/background xử lý video;
 - overlay title/part: bật/tắt, font, màu, cỡ chữ;
 - đường dẫn FFmpeg/FFprobe bundled.
 
@@ -148,7 +149,7 @@ mmo_app\schema.sql
 Schema hiện tại dùng SQLite, version:
 
 ```text
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ```
 
 Các bảng chính:
@@ -160,9 +161,9 @@ Các bảng chính:
 | `artifacts` | File sinh ra trong pipeline: download/rendered/... |
 | `jobs` | Hàng đợi chung cho `download`, `process`, `upload` |
 | `job_events` | Log/audit theo job |
-| `tiktok_accounts` | Kênh/account TikTok đích |
+| `tiktok_accounts` | Kênh/account TikTok đích, gồm mode upload, limit và hashtag caption |
 | `channel_routes` | Một layout mapping YouTube sources → TikTok account |
-| `channel_route_sources` | Danh sách kênh YouTube thuộc một route/layout |
+| `channel_route_sources` | Danh sách kênh YouTube thuộc một route/layout, gồm segment/zoom/speed/background riêng |
 | `upload_tasks` | Nhiệm vụ upload từng rendered artifact lên TikTok |
 
 ### Trạng thái job
@@ -594,6 +595,48 @@ pad=<w>:<h>:(ow-iw)/2:(oh-ih)/2:black
 
 Mục tiêu: giữ toàn bộ hình gốc trong canvas đích, không kéo méo video; phần dư là nền đen để có không gian chèn title/part.
 
+### Processing options
+
+Các option theo từng kênh YouTube nằm ở `channel_route_sources`:
+
+```text
+segment_seconds
+background_path
+```
+
+`ProcessHandler._processing_options(channel_id)` chỉ ưu tiên option theo kênh cho:
+
+- `segment_seconds`: thời lượng mỗi part của riêng kênh đó.
+- `background_path`: file ảnh/video nền. Khi có background và aspect ratio cố định, render dùng `-filter_complex` với input nền `[1:v]` và overlay foreground `[0:v]`.
+
+`Settings.segment_seconds` chỉ còn là fallback nội bộ cho dữ liệu legacy hoặc row cũ bị thiếu `segment_seconds`; UI không hiển thị cấu hình thời lượng chung ở tab `Cấu hình`. Người dùng chỉnh thời lượng cắt tại từng source YouTube trong layout.
+
+`zoom_percent` và `speed` là cấu hình chung toàn app, lấy từ `Settings.video_zoom_percent` và `Settings.video_speed`. Các cột cũ trong `channel_route_sources` nếu tồn tại chỉ để tương thích database, không dùng để override theo kênh.
+
+UI hiển thị zoom bằng slider factor `0–3`, mặc định `1`. Khi lưu, app convert factor sang `Settings.video_zoom_percent` để tương thích config cũ:
+
+```text
+factor 1.0 → video_zoom_percent 100
+factor 1.5 → video_zoom_percent 150
+factor 0.8 → video_zoom_percent 80
+```
+
+`zoom_percent` nội bộ hỗ trợ khoảng `0–300`:
+
+- `<100`: zoom out, scale nhỏ hơn canvas rồi pad nền.
+- `100`: fit mặc định.
+- `>100`: zoom in, scale lớn hơn, crop phần vượt canvas ở giữa và pad phần còn thiếu nếu video không phủ hết một chiều.
+
+Khi tăng speed, segment được tính trên effective duration:
+
+```text
+effective_duration = source_duration / speed
+source_start = output_start * speed
+source_length = output_length * speed
+```
+
+Nhờ vậy nếu người dùng đặt 60 giây/part và speed `1.5`, part output vẫn xấp xỉ 60 giây thay vì 40 giây.
+
 ### Overlay title/part
 
 Settings:
@@ -610,6 +653,7 @@ Khi bật:
 - title YouTube được chèn ở phía trên;
 - nếu có nhiều segment, phía dưới chèn `Part 1`, `Part 2`, ...
 - text tiếng Việt được ghi qua file UTF-8 tạm, rồi FFmpeg `drawtext` đọc bằng `textfile`.
+- với canvas cố định như `9:16`, app dùng `ffprobe` lấy width/height video gốc, tính `VideoBox` sau khi scale/pad, rồi đặt title/part theo mép video: title `video_top - text_h - 24`, part `video_bottom + 24`.
 
 Segment splitting dùng `ProcessHandler.segment_ranges(duration, target_seconds)`. Nếu segment cuối ngắn hơn `target_seconds / 2`, segment cuối được merge vào segment trước để tránh tạo một file cuối quá ngắn.
 
@@ -637,31 +681,22 @@ Caption không lấy từ tên file.
 Nguồn caption:
 
 ```text
-media_items.title
+tiktok_accounts.hashtags
 ```
 
 Khi tạo upload task:
 
 ```text
-upload_tasks.caption = media_items.title
-```
-
-Nếu video có nhiều part:
-
-```text
-<YouTube title> - Part 1
-<YouTube title> - Part 2
-<YouTube title> - Part 3
+upload_tasks.caption = ProcessHandler.normalize_hashtag_caption(tiktok_accounts.hashtags)
 ```
 
 Ví dụ:
 
 ```text
-Title YouTube: 10 Bí Mật Thú Vị Về Đại Dương
+TikTok account hashtags: review, #viral #tiktok
 
 Upload caption:
-10 Bí Mật Thú Vị Về Đại Dương - Part 1
-10 Bí Mật Thú Vị Về Đại Dương - Part 2
+#review #viral #tiktok
 ```
 
 Đường dẫn file như:
@@ -671,6 +706,8 @@ processed\TikTok Kien Thuc\abc123\001.mp4
 ```
 
 không ảnh hưởng đến caption.
+
+Title YouTube vẫn nằm ở `media_items.title`, dùng cho overlay title và report Excel. Không đưa title/Part vào TikTok caption nữa.
 
 ---
 
@@ -701,8 +738,29 @@ Lấy:
 
 ```text
 artifact path
-caption
+caption hashtag
 account endpoint/CDP URL
+```
+
+### TikTok hashtag suggestion
+
+TikTok chỉ coi hashtag là hashtag thật khi người dùng chọn suggestion trong popup. Vì vậy `_playwright_upload()` không chỉ gõ toàn bộ caption dạng text. Nó gọi:
+
+```text
+UploadHandler._fill_tiktok_caption(page, editor, caption)
+  → gõ từng #tag
+  → tìm `.mention-list-popover [role="option"].focused`
+  → nếu có thì click item đầu tiên bằng `_human_click()`
+  → fallback Enter nếu selector không thấy
+```
+
+Các selector chính:
+
+```text
+.mention-list-popover [role="option"].focused
+.mention-list-popover [role="option"]
+.hashtag-suggestion-item.focused
+.hashtag-suggestion-item
 ```
 
 ### Publish guard
@@ -781,9 +839,55 @@ gpm
 ```
 
 - `cdp`: dùng `endpoint` làm Chrome CDP URL và upload bằng Playwright.
-- `gpm`: dùng `gpm_profile_id` để chuẩn bị tích hợp GPM Automation.
+- `gpm`: dùng `gpm_profile_id` để gọi GPM Login API, mở đúng browser profile, lấy CDP endpoint rồi upload bằng Playwright.
 
-Ở bản hiện tại, `gpm` là option cấu hình/định tuyến trước. `UploadHandler` sẽ chuyển job sang `manual_action` với thông báo rõ rằng adapter GPM chưa được triển khai production. Khi tích hợp GPM thật, nên thêm adapter riêng thay vì nhét logic GPM trực tiếp vào `_playwright_upload()`.
+Luồng GPM nằm trong `mmo_app\services.py`:
+
+```text
+UploadHandler.run()
+  nếu mode == "gpm"
+    → UploadHandler._start_gpm_profile()
+    → GpmLoginClient.start_profile(profile_id)
+    → GET {settings.gpm_api_url}/profiles/start/{profile_id}
+    → parse remote_debugging_address / CDP endpoint
+    → UploadHandler._playwright_upload(path, caption, cdp_url)
+```
+
+Nếu GPM trả `ProfileInUse`, `GpmLoginClient.start_profile()` xử lý theo thứ tự:
+
+```text
+1. Parse CDP endpoint từ response nếu GPM vẫn trả kèm data.
+2. Dò process Chrome/GPM đang chạy để tìm --remote-debugging-port theo profile id.
+3. Nếu Settings.gpm_reclaim_profile_in_use=true:
+   → GET /profiles/stop/{profile_id}
+   → đợi ngắn
+   → GET /profiles/start/{profile_id}
+   → parse CDP endpoint mới
+4. Nếu vẫn không có endpoint, raise ManualAction.
+```
+
+Option `gpm_reclaim_profile_in_use` mặc định bật để profile GPM do MMO App quản lý nhất quán. Người dùng có thể tắt nếu không muốn app đóng cửa sổ profile đang mở thủ công.
+
+`GpmLoginClient` cố ý tách riêng khỏi `_playwright_upload()` để phần DOM TikTok/CDP dùng chung cho cả hai mode:
+
+```text
+cdp: dùng endpoint người dùng nhập
+gpm: dùng endpoint GPM Login trả về sau khi start profile
+```
+
+Các field response GPM được hỗ trợ linh hoạt:
+
+```text
+data.remote_debugging_address
+data.remoteDebuggingAddress
+data.remote_debugging_port
+data.websocket_debugging_url
+data.browserWSEndpoint
+data.wsEndpoint
+data.webSocketDebuggerUrl
+```
+
+Nếu không lấy được CDP endpoint, job upload chuyển sang `manual_action` để người dùng kiểm tra GPM Login, API URL hoặc Profile ID.
 
 ---
 
@@ -932,7 +1036,9 @@ Các nhóm cần giữ:
 - retry/recovery;
 - process route đúng folder TikTok;
 - tỷ lệ video mobile không kéo méo;
-- split caption có `Part 1`, `Part 2`;
+- upload caption dùng hashtag từ `tiktok_accounts.hashtags`;
+- hashtag caption phải chọn suggestion đầu tiên của TikTok;
+- per-channel processing options: segment/zoom/speed/background;
 - overlay title/part dùng UTF-8 text files.
 
 Lệnh test thường dùng:
@@ -1094,10 +1200,10 @@ Upload tasks:
 
 ```text
 upload_tasks:
-  caption = "Một video ví dụ - Part 1"
+  caption = "#review #viral #tiktok"
 
 upload_tasks:
-  caption = "Một video ví dụ - Part 2"
+  caption = "#review #viral #tiktok"
 ```
 
 Upload jobs:

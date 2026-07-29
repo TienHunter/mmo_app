@@ -99,7 +99,17 @@ Luồng YouTube → TikTok
    TikTok Review Phim
    ```
 
-4. Nhập TikTok Chrome CDP URL nếu layout này dùng một Chrome profile riêng.
+4. Nhập hashtag cho caption TikTok.
+
+   Ví dụ:
+
+   ```text
+   #review #viral #tiktok
+   ```
+
+   Caption upload TikTok chỉ dùng các hashtag này. Title YouTube không còn đưa vào caption, mà chỉ dùng để chèn lên video/báo cáo.
+
+5. Nhập TikTok Chrome CDP URL nếu layout này dùng một Chrome profile riêng.
 
    Ví dụ:
 
@@ -107,7 +117,7 @@ Luồng YouTube → TikTok
    http://127.0.0.1:9222
    ```
 
-5. Ở phần `Nguồn YouTube`, nhập URL kênh YouTube.
+6. Ở phần `Nguồn YouTube`, nhập URL kênh YouTube.
 
    Ví dụ:
 
@@ -115,13 +125,22 @@ Luồng YouTube → TikTok
    https://www.youtube.com/@tien5140
    ```
 
-6. Nếu muốn thêm kênh YouTube thứ hai cho cùng kênh TikTok, bấm:
+   Mỗi dòng YouTube có cấu hình riêng:
+
+   ```text
+   Đoạn (giây): thời lượng mỗi part của riêng kênh này
+   Background: file ảnh/video nền riêng cho kênh đó
+   ```
+
+   `Đoạn (giây)` chỉ nằm ở từng nguồn YouTube, không còn cấu hình chung trong tab `Cấu hình`. `Zoom video` và `Speed` vẫn là cấu hình chung toàn app trong tab `Cấu hình`, không đặt riêng theo từng kênh YouTube.
+
+7. Nếu muốn thêm kênh YouTube thứ hai cho cùng kênh TikTok, bấm:
 
    ```text
    ＋ YouTube
    ```
 
-7. Sau khi nhập xong, bấm lưu cấu hình.
+8. Sau khi nhập xong, bấm lưu cấu hình.
 
 App sẽ tự lấy `channel_id` từ URL kênh YouTube để dùng cho WebSub. Người dùng không cần tự tìm hoặc nhập `channel_id`.
 
@@ -381,6 +400,28 @@ Khi bật, app sẽ:
 
 Khi chia video theo thời lượng, nếu đoạn cuối ngắn hơn một nửa thời lượng yêu cầu thì app sẽ gộp đoạn cuối vào phần trước đó. Ví dụ đặt 60 giây/phần, video dài 130 giây sẽ ra 2 phần: 60 giây và 70 giây, không tạo thêm phần 10 giây.
 
+### Cấu hình riêng theo từng kênh YouTube
+
+Trong tab `Luồng YouTube → TikTok`, mỗi nguồn YouTube có các option riêng:
+
+- `Đoạn (giây)`: thời lượng mỗi đoạn của kênh YouTube đó.
+- `Background`: ảnh/video nền riêng cho kênh đó. Nếu để trống, app dùng nền đen khi chuyển tỷ lệ.
+
+Lưu ý: tab `Cấu hình` không còn mục thời lượng mỗi đoạn. Muốn đổi thời lượng cắt video, hãy đổi trực tiếp ở dòng YouTube tương ứng rồi bấm `Lưu cấu hình`.
+
+Trong tab `Cấu hình`, `Zoom video toàn app` và `Speed toàn app` áp dụng chung cho mọi kênh YouTube:
+
+- `Zoom video toàn app`: thanh trượt từ `0` đến `3`, mặc định `1`.
+  - `1`: giữ kích thước fit mặc định.
+  - Nhỏ hơn `1`, ví dụ `0.8`: thu nhỏ video để lộ nhiều nền hơn.
+  - Lớn hơn `1`, ví dụ `1.2` hoặc `1.5`: phóng to video; phần vượt khung sẽ được crop ở giữa.
+  - `3`: tương đương 300%.
+- `Speed toàn app`: tăng/giảm tốc độ video. Ví dụ `1.25` là nhanh hơn 25%.
+
+Nếu muốn dùng background riêng, nên chọn `Tỷ lệ video đầu ra` là `9:16`, `4:5`, `1:1` hoặc `16:9`. Với `original`, app giữ tỷ lệ gốc nên background riêng sẽ không có nhiều ý nghĩa.
+
+Title và Part được đặt theo mép video gốc sau khi chuyển tỷ lệ. Ví dụ video ngang chuyển sang `9:16` sẽ có vùng đen/nền phía trên và phía dưới; title nằm trong vùng phía trên, cách mép trên của video khoảng `24px`, còn Part nằm trong vùng phía dưới, cách mép dưới của video khoảng `24px`. Khi bật overlay, title/part có nền bán trong suốt để dễ đọc.
+
 Ví dụ cấu hình:
 
 ```text
@@ -401,27 +442,25 @@ Nếu để trống font chữ, app sẽ dùng Arial mặc định trên Windows
 
 ## 6. Caption khi upload TikTok
 
-Caption TikTok được lấy từ title YouTube, không lấy từ tên file.
+Caption TikTok chỉ dùng hashtag bạn nhập trong layout TikTok, không lấy từ title YouTube và không lấy từ tên file.
 
-Ví dụ video YouTube có title:
-
-```text
-10 Bí Mật Thú Vị Về Đại Dương
-```
-
-Nếu video không bị chia part, caption TikTok là:
+Ví dụ trong layout bạn nhập:
 
 ```text
-10 Bí Mật Thú Vị Về Đại Dương
+#review #viral #tiktok
 ```
 
-Nếu video bị chia thành 3 part, caption lần lượt là:
+Khi upload, app sẽ nhập từng hashtag vào ô description/caption TikTok. Sau mỗi hashtag, nếu TikTok xổ danh sách gợi ý hashtag, app sẽ click item đầu tiên để TikTok ghi nhận đó là hashtag thật, không chỉ là text thường.
+
+Ví dụ popup TikTok có các gợi ý:
 
 ```text
-10 Bí Mật Thú Vị Về Đại Dương - Part 1
-10 Bí Mật Thú Vị Về Đại Dương - Part 2
-10 Bí Mật Thú Vị Về Đại Dương - Part 3
+#tik
+#tiktok
+#tiktokviral
 ```
+
+App sẽ click gợi ý đầu tiên đang hiện ra sau khi nhập hashtag.
 
 File xử lý có thể nằm dạng:
 
@@ -430,7 +469,7 @@ processed\TikTok Review Phim\<YouTube video ID>\001.mp4
 processed\TikTok Review Phim\<YouTube video ID>\002.mp4
 ```
 
-Nhưng caption vẫn lấy từ database/hàng đợi upload, không lấy từ tên thư mục hoặc tên file.
+Title YouTube vẫn được lưu trong database/báo cáo Excel và dùng để chèn lên video nếu bạn bật overlay.
 
 ---
 
@@ -466,7 +505,7 @@ gpm
 ```
 
 - `cdp`: app kết nối tới Chrome đang mở cổng CDP rồi dùng Playwright để upload/đăng video.
-- `gpm`: lưu cấu hình để dùng GPM Automation trong bước tích hợp tiếp theo.
+- `gpm`: app gọi GPM Login API để mở đúng browser profile, lấy CDP endpoint do GPM trả về, rồi dùng Playwright để upload/đăng video.
 
 Nếu chọn `cdp`, cần nhập:
 
@@ -530,7 +569,48 @@ Nếu chọn `gpm`, cần nhập:
 GPM Profile ID
 ```
 
-Lưu ý: ở bản hiện tại, chế độ `gpm` mới được lưu cấu hình và route tài khoản. Adapter upload thật qua GPM sẽ được tích hợp ở bản tiếp theo, nên job upload sẽ dừng ở trạng thái cần thao tác nếu chọn `gpm`.
+Và trong tab `Cấu hình`, kiểm tra:
+
+```text
+GPM API URL: http://127.0.0.1:9495/api/v1
+```
+
+Đây là API local hiện tại theo tài liệu GPM Login. Bạn cần mở GPM Login trước khi bấm `Bắt đầu` trong MMO App.
+
+Theo tài liệu GPM Login, mặc định server local chạy ở port `9495`. Nếu port này bận, GPM có thể chọn port khác trong khoảng `8000–10000`; lúc đó hãy xem port đang chạy trong GPM Login hoặc file `http.port` của GPM, rồi sửa lại ô `GPM API URL` tương ứng.
+
+Trong tab `Cấu hình` có option:
+
+```text
+GPM ProfileInUse: tự đóng profile và mở lại bằng app
+```
+
+Nên bật option này nếu bạn hay lỡ mở profile thủ công trong GPMLogin trước. Khi GPM báo `ProfileInUse` và app không tìm được CDP port để dùng lại, app sẽ gọi:
+
+```text
+GET /api/v1/profiles/stop/{profile_id}
+GET /api/v1/profiles/start/{profile_id}
+```
+
+Sau đó app lấy lại CDP endpoint mới để tiếp tục upload. Lưu ý: nếu bạn đang thao tác thủ công trong cửa sổ profile đó, app có thể đóng cửa sổ đó để giành quyền quản lý automation.
+
+Ví dụ cấu hình 2 kênh TikTok qua GPM:
+
+```text
+Layout 1
+  Chế độ upload: gpm
+  Kênh TikTok: TikTok Review Phim
+  GPM Profile ID: 8899aaaa-bbbb-cccc-dddd-eeeeffff0001
+
+Layout 2
+  Chế độ upload: gpm
+  Kênh TikTok: TikTok Công Nghệ
+  GPM Profile ID: 8899aaaa-bbbb-cccc-dddd-eeeeffff0002
+```
+
+Mỗi kênh TikTok nên dùng một profile GPM riêng. Trước khi chạy flow thật, hãy mở từng profile trong GPM một lần, đăng nhập TikTok, xử lý captcha/xác minh nếu có, rồi đóng hoặc để GPM quản lý. Khi app cần upload, app sẽ tự gọi GPM để mở profile đó.
+
+Nếu GPM API không mở được profile, job upload sẽ dừng ở trạng thái `manual_action` và log sẽ ghi rõ lỗi như sai `GPM API URL`, sai `GPM Profile ID`, hoặc GPM chưa chạy.
 
 ### Giới hạn đăng/ngày
 

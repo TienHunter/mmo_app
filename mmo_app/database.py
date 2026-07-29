@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Database:
@@ -55,10 +55,21 @@ class Database:
                 "posts_today": "INTEGER NOT NULL DEFAULT 0",
                 "counter_date": "TEXT",
                 "status": "TEXT NOT NULL DEFAULT 'idle'",
+                "hashtags": "TEXT NOT NULL DEFAULT ''",
             }
             for name, declaration in account_additions.items():
                 if name not in account_columns:
                     connection.execute(f"ALTER TABLE tiktok_accounts ADD COLUMN {name} {declaration}")
+            source_columns = {row["name"] for row in connection.execute("PRAGMA table_info(channel_route_sources)")}
+            source_additions = {
+                "segment_seconds": "INTEGER",
+                "zoom_percent": "INTEGER NOT NULL DEFAULT 100",
+                "speed": "REAL NOT NULL DEFAULT 1.0",
+                "background_path": "TEXT NOT NULL DEFAULT ''",
+            }
+            for name, declaration in source_additions.items():
+                if name not in source_columns:
+                    connection.execute(f"ALTER TABLE channel_route_sources ADD COLUMN {name} {declaration}")
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)", (SCHEMA_VERSION,)
             )
@@ -130,7 +141,8 @@ class Database:
     def event(self, job_id: int | None, level: str, message: str) -> None:
         with self.connect() as connection:
             connection.execute(
-                "INSERT INTO job_events(job_id,level,message) VALUES (?,?,?)", (job_id, level, message)
+                "INSERT INTO job_events(job_id,level,message,created_at) VALUES (?,?,?,?)",
+                (job_id, level, message, utc_now()),
             )
 
     def _finish(self, job_id: int, status: str, message: str | None) -> None:
