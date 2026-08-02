@@ -6,10 +6,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .application import Application
 from .reporting import export_pipeline_report
-from .services import GpmLoginClient
+from .services import GpmLoginClient, UploadHandler
 from .settings import DEFAULT_GPM_API_URL
 
 
@@ -274,6 +275,7 @@ class Desktop(tk.Tk):
         route["gpm_profile_id"] = tk.StringVar(value=data.get("gpm_profile_id") or "")
         route["daily_limit"] = tk.StringVar(value=str(data.get("daily_limit") if data.get("daily_limit") is not None else 3))
         route["hashtags"] = tk.StringVar(value=data.get("hashtags") or "")
+        route["manual_upload_path"] = tk.StringVar(value="")
         ttk.Label(card, text="Tên layout").grid(row=0, column=0, sticky="w"); ttk.Entry(card, textvariable=route["name"], width=24).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Label(card, text="Kênh TikTok").grid(row=0, column=2, sticky="w"); ttk.Entry(card, textvariable=route["account_name"], width=24).grid(row=0, column=3, sticky="ew", padx=6)
         ttk.Button(card, text="Xóa layout", command=lambda: self._remove_route(route)).grid(row=0, column=4, padx=4)
@@ -293,6 +295,12 @@ class Desktop(tk.Tk):
         route["source_frame"] = ttk.Frame(card); route["source_frame"].grid(row=7, column=1, columnspan=4, sticky="ew")
         for url in urls: self._add_source(route, url)
         ttk.Button(card, text="＋ YouTube", command=lambda: self._add_source(route)).grid(row=8, column=1, sticky="w", pady=6)
+        ttk.Label(card, text="Test upload TikTok").grid(row=9, column=0, sticky="w", pady=7)
+        ttk.Entry(card, textvariable=route["manual_upload_path"]).grid(row=9, column=1, columnspan=2, sticky="ew", padx=6, pady=7)
+        ttk.Button(card, text="Chọn file…", command=lambda: self._choose_manual_upload_file(route)).grid(row=9, column=3, sticky="w", padx=4)
+        route["manual_upload_button"] = ttk.Button(card, text="Upload", command=lambda: self._manual_upload_route(route))
+        route["manual_upload_button"].grid(row=9, column=4, sticky="w", padx=4)
+        ttk.Label(card, text="Chọn video local để chạy thử đúng luồng upload TikTok và ghi log đầy đủ").grid(row=10, column=1, columnspan=4, sticky="w", padx=6)
         for column in (1, 3): card.columnconfigure(column, weight=1)
         self.route_cards.append(route)
 
@@ -337,6 +345,76 @@ class Desktop(tk.Tk):
         )
         if path:
             source["background_path"].set(path)
+
+    def _choose_manual_upload_file(self, route) -> None:
+        path = filedialog.askopenfilename(
+            title="Chọn video local để upload TikTok",
+            filetypes=[
+                ("Video", "*.mp4 *.mov *.mkv *.webm *.avi *.m4v"),
+                ("Tất cả file", "*.*"),
+            ],
+        )
+        if path:
+            route["manual_upload_path"].set(path)
+
+    def _manual_upload_route(self, route) -> None:
+        path = route["manual_upload_path"].get().strip()
+        if not path:
+            messagebox.showwarning("Chưa chọn file", "Hãy chọn một file video local trước khi bấm Upload.")
+            return
+        file_path = Path(path)
+        if not file_path.is_file():
+            messagebox.showerror("Không tìm thấy file", f"Không tìm thấy file video:\n{file_path}")
+            route["manual_upload_path"].set("")
+            return
+        mode = route["mode"].get().strip() or "cdp"
+        endpoint = route["endpoint"].get().strip()
+        gpm_profile_id = route["gpm_profile_id"].get().strip()
+        account_name = route["account_name"].get().strip() or route["name"].get().strip() or "TikTok"
+        if mode == "cdp" and not (endpoint or self.application.settings.tiktok_cdp_url):
+            messagebox.showwarning("Thiếu CDP URL", "Layout này đang dùng CDP, hãy nhập TikTok Chrome CDP URL trước.")
+            return
+        if mode == "gpm" and not gpm_profile_id:
+            messagebox.showwarning("Thiếu GPM Profile ID", "Layout này đang dùng GPM, hãy nhập GPM Profile ID trước.")
+            return
+        button = route.get("manual_upload_button")
+        if button:
+            button.configure(state="disabled")
+        self.runtime_status.configure(text=f"● Đang upload thủ công lên {account_name}…")
+        self.application.database.event(None, "INFO", f"TikTok manual upload: người dùng chọn file {file_path} cho {account_name}")
+
+        def worker():
+            success = False
+            error: Exception | None = None
+            try:
+                UploadHandler(self.application.database, self.application.settings).manual_upload_file(
+                    file_path,
+                    route["hashtags"].get().strip(),
+                    mode,
+                    endpoint=endpoint,
+                    gpm_profile_id=gpm_profile_id,
+                    account_id=route.get("account_id"),
+                    job_id=None,
+                )
+                success = True
+            except Exception as exc:
+                error = exc
+                self.application.database.event(None, "ERROR", f"TikTok manual upload thất bại: {exc}")
+
+            def finish():
+                route["manual_upload_path"].set("")
+                if button:
+                    button.configure(state="normal")
+                if success:
+                    self.runtime_status.configure(text="● Upload thủ công hoàn tất")
+                    messagebox.showinfo("MMO App", f"Đã upload file lên {account_name}.\nÔ chọn file đã được xóa.")
+                else:
+                    self.runtime_status.configure(text="● Upload thủ công thất bại")
+                    messagebox.showerror("Upload TikTok thất bại", str(error))
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, name="manual-tiktok-upload", daemon=True).start()
 
     def _remove_route(self, route) -> None:
         route["frame"].destroy(); self.route_cards.remove(route)

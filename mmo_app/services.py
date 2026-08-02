@@ -736,6 +736,50 @@ class UploadHandler:
     def __init__(self, database: Database, settings: Settings):
         self.db, self.settings = database, settings
 
+    def manual_upload_file(
+        self,
+        path: Path,
+        caption: str,
+        mode: str,
+        endpoint: str = "",
+        gpm_profile_id: str = "",
+        account_id: int | None = None,
+        job_id: int | None = None,
+    ) -> None:
+        """Run the real TikTok upload flow for a user-selected local file.
+
+        This is intentionally not queued as a normal pipeline job: it is a
+        deliberate UI action for testing or one-off manual posting from a
+        specific TikTok layout. It still writes full logs to job_events so the
+        Log tab shows the same TikTok/GPM detail as automatic uploads.
+        """
+        path = Path(path)
+        today = utc_now()[:10]
+        mode = (mode or "cdp").strip().lower()
+        caption = self.normalize_manual_caption(caption)
+        self.db.event(job_id, "INFO", f"TikTok manual upload: bắt đầu file {path}")
+        if mode == "gpm":
+            cdp_url = self._start_gpm_profile(gpm_profile_id, account_id or 0, job_id)
+        else:
+            cdp_url = (endpoint or self.settings.tiktok_cdp_url or "").strip()
+        self._playwright_upload(
+            path,
+            caption,
+            cdp_url,
+            log=lambda message: self.db.event(job_id, "INFO", message),
+        )
+        if account_id:
+            with self.db.connect() as connection:
+                connection.execute(
+                    "UPDATE tiktok_accounts SET posts_today=posts_today+1,counter_date=?,status='idle' WHERE id=?",
+                    (today, account_id),
+                )
+        self.db.event(job_id, "INFO", "TikTok manual upload: hoàn tất")
+
+    @staticmethod
+    def normalize_manual_caption(value: str) -> str:
+        return ProcessHandler.normalize_hashtag_caption(value or "")
+
     def run(self, job) -> None:
         payload = json.loads(job["payload"])
         with self.db.connect() as connection:
@@ -830,12 +874,13 @@ class UploadHandler:
                 raise ManualAction(f"{exc}\n{diagnostic}") from exc
             emit("TikTok: đang chờ ô caption/hashtag")
             editor = UploadHandler._find_tiktok_caption_editor(page, timeout=20 * 60_000)
-            emit("TikTok: đã thấy ô caption, bắt đầu nhập hashtag")
+            emit("TikTok: đã thấy ô caption, bắt đầu nhập hashtag trong khi TikTok xử lý video")
             UploadHandler._human_click(page, editor)
             UploadHandler._fill_tiktok_caption(page, editor, caption, log=emit)
-            emit("TikTok: đã nhập hashtag, đang chờ nút Post")
+            emit("TikTok: đã nhập hashtag, đang chờ video xử lý xong hoặc nút Post sẵn sàng")
             post = page.get_by_role("button", name=re.compile(r"^(Post|Đăng)$")).first
-            post.wait_for(state="visible", timeout=20 * 60_000)
+            UploadHandler._wait_for_tiktok_video_ready(page, post, timeout=20 * 60_000, log=emit)
+            post.wait_for(state="visible", timeout=10_000)
             emit("TikTok: đang bấm Post")
             UploadHandler._human_click(page, post)
             UploadHandler._confirm_tiktok_post_if_needed(page)
@@ -932,6 +977,47 @@ class UploadHandler:
             return False
 
     @staticmethod
+    def _wait_for_tiktok_video_ready(page, post_locator, timeout: int = 20 * 60_000, log: Callable[[str], None] | None = None) -> bool:
+        """Wait until TikTok indicates the uploaded video is ready to post.
+
+        TikTok can show the caption editor before the video finishes processing,
+        so the uploader fills hashtags first and then waits for either the
+        success check icon or the Post button to become available.
+        """
+        emit = log or (lambda _message: None)
+        ready_selectors = (
+            '[data-testid="CheckCircleFill"]',
+            'span[role="img"][data-icon="CheckCircleFill"]',
+            'span[data-icon="CheckCircleFill"]',
+            'svg[data-icon="check-circle-fill"]',
+            '.px-icon[data-testid="CheckCircleFill"]',
+        )
+        deadline = time.time() + timeout / 1000
+        last_error = None
+        while time.time() < deadline:
+            remaining = int(max(1_000, (deadline - time.time()) * 1000))
+            try:
+                post_locator.wait_for(state="visible", timeout=min(1_000, remaining))
+                emit("TikTok: nút Post đã visible")
+                return True
+            except Exception as exc:
+                last_error = exc
+            for selector in ready_selectors:
+                try:
+                    page.locator(selector).first.wait_for(state="visible", timeout=500)
+                    emit("TikTok: video đã xử lý xong (CheckCircleFill)")
+                    return True
+                except Exception as exc:
+                    last_error = exc
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                time.sleep(0.5)
+        if last_error:
+            raise last_error
+        raise RuntimeError("TikTok chưa báo video xử lý xong và nút Post chưa sẵn sàng")
+
+    @staticmethod
     def _select_tiktok_upload_file(page, path: Path, timeout: int = 45_000, log: Callable[[str], None] | None = None) -> None:
         """Select a video file using a direct file input or TikTok's select-video button."""
         emit = log or (lambda _message: None)
@@ -950,9 +1036,7 @@ class UploadHandler:
             except Exception as exc:
                 raise RuntimeError(f"TikTok: đã tìm thấy input[type=file] nhưng set file thất bại cho {path}: {exc}") from exc
             emit(f"TikTok: đã set file {path.name}")
-            emit("TikTok: đang chờ form caption")
-            UploadHandler._wait_for_tiktok_upload_form(page, timeout=timeout)
-            emit("TikTok: đã thấy form caption/upload details")
+            emit("TikTok: file đã được gửi vào TikTok, tiếp tục chờ ô caption để nhập song song lúc video xử lý")
             return
         button_selectors = (
             'button[aria-label="Select video"]',
@@ -972,9 +1056,7 @@ class UploadHandler:
                     UploadHandler._human_click(page, button, timeout=min(10_000, remaining))
                 chooser.value.set_files(str(path))
                 emit(f"TikTok: đã set file {path.name} qua file chooser")
-                emit("TikTok: đang chờ form caption")
-                UploadHandler._wait_for_tiktok_upload_form(page, timeout=timeout)
-                emit("TikTok: đã thấy form caption/upload details")
+                emit("TikTok: file đã được gửi vào TikTok, tiếp tục chờ ô caption để nhập song song lúc video xử lý")
                 return
             except Exception as exc:
                 last_error = exc
@@ -1016,11 +1098,12 @@ class UploadHandler:
     @staticmethod
     def _find_tiktok_caption_editor(page, timeout: int = 20 * 60_000):
         selectors = (
+            '[contenteditable="true"][role="combobox"]',
+            '[contenteditable="true"]',
             '[contenteditable="true"][role="textbox"]',
             '[contenteditable="true"][aria-label*="caption" i]',
             '[contenteditable="true"][aria-label*="description" i]',
             '[contenteditable="true"][data-e2e*="caption" i]',
-            '[contenteditable="true"]',
             'textarea[placeholder*="caption" i]',
             'textarea[placeholder*="description" i]',
         )

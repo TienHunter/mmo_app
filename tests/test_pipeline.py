@@ -771,6 +771,40 @@ class PipelineDatabaseTests(unittest.TestCase):
             task = connection.execute("SELECT status FROM upload_tasks WHERE id=?", (task_id,)).fetchone()
         self.assertEqual("completed", task["status"])
 
+    def test_manual_tiktok_upload_uses_layout_config_and_logs(self):
+        video = Path(self.temp.name) / "manual.mp4"
+        video.write_bytes(b"demo")
+        with self.db.connect() as connection:
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name,mode,gpm_profile_id,hashtags) VALUES ('TikTok Manual','gpm','profile-manual','viral, #review')"
+            ).lastrowid
+        calls = []
+        original_start = UploadHandler._start_gpm_profile
+        original_upload = UploadHandler._playwright_upload
+        try:
+            UploadHandler._start_gpm_profile = lambda handler, profile_id, account_id, job_id=None: calls.append(("start", profile_id, account_id)) or "http://127.0.0.1:45678"
+            UploadHandler._playwright_upload = staticmethod(lambda path, caption, cdp_url, log=None: calls.append(("upload", str(path), caption, cdp_url)) or (log and log("TikTok: fake upload ok")))
+            UploadHandler(self.db, self.settings).manual_upload_file(
+                video,
+                "viral, #review",
+                "gpm",
+                gpm_profile_id="profile-manual",
+                account_id=account_id,
+            )
+        finally:
+            UploadHandler._start_gpm_profile = original_start
+            UploadHandler._playwright_upload = original_upload
+        self.assertEqual(("start", "profile-manual", account_id), calls[0])
+        self.assertEqual(("upload", str(video), "#viral #review", "http://127.0.0.1:45678"), calls[1])
+        with self.db.connect() as connection:
+            account = connection.execute("SELECT posts_today,status FROM tiktok_accounts WHERE id=?", (account_id,)).fetchone()
+            events = [row["message"] for row in connection.execute("SELECT message FROM job_events ORDER BY id")]
+        self.assertEqual(1, account["posts_today"])
+        self.assertEqual("idle", account["status"])
+        self.assertTrue(any("TikTok manual upload: bắt đầu file" in item for item in events))
+        self.assertTrue(any("TikTok: fake upload ok" in item for item in events))
+        self.assertTrue(any("TikTok manual upload: hoàn tất" in item for item in events))
+
     def _insert_upload_task(self, daily_limit=3, posts_today=0, counter_date=None):
         with self.db.connect() as connection:
             media_id = connection.execute(
@@ -1003,6 +1037,39 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual([(60.0, 45.0)], page.mouse.clicks)
         self.assertFalse(locator.clicked)
 
+    def test_tiktok_wait_video_ready_accepts_check_circle_icon(self):
+        class FakePost:
+            def wait_for(self, **kwargs):
+                raise RuntimeError("post not ready yet")
+
+        class FakeIcon:
+            @property
+            def first(self):
+                return self
+
+            def wait_for(self, **kwargs):
+                self.wait_kwargs = kwargs
+
+        class FakePage:
+            def __init__(self):
+                self.icon = FakeIcon()
+                self.selectors = []
+
+            def locator(self, selector):
+                self.selectors.append(selector)
+                if selector == '[data-testid="CheckCircleFill"]':
+                    return self.icon
+                raise RuntimeError("not visible")
+
+            def wait_for_timeout(self, timeout):
+                self.timeout = timeout
+
+        logs = []
+        page = FakePage()
+        self.assertTrue(UploadHandler._wait_for_tiktok_video_ready(page, FakePost(), timeout=2_000, log=logs.append))
+        self.assertEqual('[data-testid="CheckCircleFill"]', page.selectors[0])
+        self.assertIn("TikTok: video đã xử lý xong (CheckCircleFill)", logs)
+
     def test_tiktok_caption_selects_first_hashtag_suggestion(self):
         original_click = UploadHandler._human_click
 
@@ -1093,8 +1160,7 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertFalse(page.button_requested)
         self.assertIn("TikTok: đã tìm thấy input[type=file]", logs)
         self.assertIn("TikTok: đã set file hidden.mp4", logs)
-        self.assertIn("TikTok: đang chờ form caption", logs)
-        self.assertIn("TikTok: đã thấy form caption/upload details", logs)
+        self.assertIn("TikTok: file đã được gửi vào TikTok, tiếp tục chờ ô caption để nhập song song lúc video xử lý", logs)
 
     def test_tiktok_upload_reports_file_input_set_failure(self):
         class FakeInput:
@@ -1148,7 +1214,7 @@ class PipelineDatabaseTests(unittest.TestCase):
         finally:
             UploadHandler._find_tiktok_file_input = original
         self.assertEqual("hidden.mp4", page.input.path)
-        self.assertTrue(any("contenteditable" in selector for selector in page.selectors))
+        self.assertEqual("hidden.mp4", page.input.path)
 
     def test_tiktok_file_select_fallback_accepts_already_visible_caption_form(self):
         original_input = UploadHandler._find_tiktok_file_input
