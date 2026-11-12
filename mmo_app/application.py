@@ -28,6 +28,7 @@ class Application:
         self.pipeline = PipelineOrchestrator(self.database, self.settings)
         self.stop_event = threading.Event()
         self.rss_thread: threading.Thread | None = None
+        self.websub_subscribe_thread: threading.Thread | None = None
         self.started = False
 
     def start(self) -> bool:
@@ -37,7 +38,7 @@ class Application:
         self.stop_event.clear()
         if self.settings.tracking_mode in {"websub", "both"}:
             self.websub.start()
-            threading.Thread(target=lambda: self.websub.renew_due(force=True), name="websub-subscribe", daemon=True).start()
+            self._start_websub_subscribe_thread(force=True)
         self.pipeline.start()
         if not self.rss_thread or not self.rss_thread.is_alive():
             self.rss_thread = threading.Thread(target=self._rss_loop, name="rss-scheduler", daemon=True)
@@ -51,13 +52,20 @@ class Application:
         self.pipeline.pause()
         if self.rss_thread:
             self.rss_thread.join(3)
+        if self.websub_subscribe_thread:
+            self.websub_subscribe_thread.join(3)
 
     @property
     def is_running(self) -> bool:
+        alive = getattr(self.pipeline, "is_alive", None)
+        if alive is None:
+            alive = bool(
+                getattr(self.pipeline, "thread", None)
+                and self.pipeline.thread.is_alive())
+        elif callable(alive):
+            alive = alive()
         return bool(
-            self.started
-            and self.pipeline.thread
-            and self.pipeline.thread.is_alive()
+            self.started and alive
             and not self.pipeline.pause_event.is_set()
         )
 
@@ -68,6 +76,8 @@ class Application:
         self.pipeline.stop()
         if self.rss_thread:
             self.rss_thread.join(3)
+        if self.websub_subscribe_thread:
+            self.websub_subscribe_thread.join(3)
 
     def _rss_loop(self) -> None:
         next_rss = 0.0
@@ -88,7 +98,22 @@ class Application:
         self.websub.stop()
         if self.settings.tracking_mode in {"websub", "both"}:
             self.websub.start()
-            threading.Thread(target=lambda: self.websub.renew_due(force=True), name="websub-subscribe", daemon=True).start()
+            self._start_websub_subscribe_thread(force=True)
+
+    def refresh_websub_subscriptions(self, force: bool = False) -> None:
+        """Subscribe newly added/reactivated channels without restarting the app."""
+        if self.started and self.settings.tracking_mode in {"websub", "both"}:
+            self._start_websub_subscribe_thread(force=force)
+
+    def _start_websub_subscribe_thread(self, force: bool = False) -> None:
+        if self.websub_subscribe_thread and self.websub_subscribe_thread.is_alive():
+            return
+        self.websub_subscribe_thread = threading.Thread(
+            target=lambda: self.websub.renew_due(force=force),
+            name="websub-subscribe",
+            daemon=True,
+        )
+        self.websub_subscribe_thread.start()
 
     def _validate_ready_to_start(self) -> None:
         with self.database.connect() as connection:

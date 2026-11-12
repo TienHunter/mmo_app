@@ -3,6 +3,7 @@
 /dist/
 /dist_release/
 /dist_websub/
+/dist_preview/
 *.spec.bak
 
 # Python cache/test artifacts

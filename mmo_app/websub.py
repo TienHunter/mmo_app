@@ -94,6 +94,7 @@ class WebSubService:
                 LOGGER.info("WebSub HTTP: " + pattern, *args)
 
         self.server = ThreadingHTTPServer((self.settings.webhook_host, self.settings.webhook_port), Handler)
+        self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, name="websub-server", daemon=True)
         self.thread.start()
         LOGGER.info("WebSub callback listening on http://%s:%s/webhook", self.settings.webhook_host, self.settings.webhook_port)

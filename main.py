@@ -1,6 +1,6 @@
 from multiprocessing import freeze_support
 
-from mmo_app.desktop import run
+from mmo_app.ui.main_window import run
 
 
 if __name__ == "__main__":

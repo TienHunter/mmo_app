@@ -2,3 +2,5 @@ Pillow>=11,<12
 pystray>=0.19,<1
 yt-dlp[default]>=2025.1.0
 playwright>=1.45,<2
+# Qt Widgets + core runtime only; WebEngine/PDF add-ons are not needed by MMO App.
+PySide6-Essentials>=6.8,<7

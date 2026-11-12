@@ -22,8 +22,10 @@ for package in ("yt_dlp", "playwright"):
 
 a = Analysis([str(root / "main.py")], pathex=[str(root)], binaries=binaries, datas=datas,
     hiddenimports=hiddenimports, hookspath=[], hooksconfig={},
-    runtime_hooks=[], excludes=[], noarchive=False)
+    runtime_hooks=[str(root / "mmo_app" / "qt_runtime_hook.py")], excludes=[], noarchive=False)
 pyz = PYZ(a.pure)
+# Qt binaries must remain uncompressed. Compressing a Qt DLL can surface as an
+# opaque "DLL load failed" error on Windows before the application UI appears.
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="MMOApp", debug=False, bootloader_ignore_signals=False,
-    strip=False, upx=True, console=False, disable_windowed_traceback=False)
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=True, name="MMOApp")
+    strip=False, upx=False, console=False, disable_windowed_traceback=False)
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="MMOApp")

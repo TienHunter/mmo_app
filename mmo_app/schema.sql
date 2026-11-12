@@ -28,7 +28,13 @@ CREATE TABLE IF NOT EXISTS tiktok_accounts(
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'cdp', endpoint TEXT,
  gpm_profile_id TEXT, active INTEGER NOT NULL DEFAULT 1, daily_limit INTEGER NOT NULL DEFAULT 3,
  posts_today INTEGER NOT NULL DEFAULT 0, counter_date TEXT, status TEXT NOT NULL DEFAULT 'idle',
- hashtags TEXT NOT NULL DEFAULT '');
+ hashtags TEXT NOT NULL DEFAULT '', speed REAL NOT NULL DEFAULT 1.0,
+ zoom_width_percent INTEGER NOT NULL DEFAULT 100, zoom_height_percent INTEGER NOT NULL DEFAULT 100,
+ caption_mode TEXT NOT NULL DEFAULT 'fixed', caption_text TEXT NOT NULL DEFAULT '',
+ output_dir TEXT NOT NULL DEFAULT '', notification_sound TEXT NOT NULL DEFAULT '',
+ split_enabled INTEGER, overlay_enabled INTEGER, background_path TEXT NOT NULL DEFAULT '',
+ publish_enabled INTEGER, ai_api_url TEXT NOT NULL DEFAULT '', ai_api_key TEXT NOT NULL DEFAULT '',
+ ai_model TEXT NOT NULL DEFAULT '', ai_system_prompt TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS channel_routes(
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, account_id INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -43,6 +49,6 @@ CREATE TABLE IF NOT EXISTS channel_route_sources(
 CREATE TABLE IF NOT EXISTS upload_tasks(
  id INTEGER PRIMARY KEY, media_item_id INTEGER NOT NULL, artifact_id INTEGER NOT NULL, account_id INTEGER,
  caption TEXT NOT NULL DEFAULT '', scheduled_at TEXT, status TEXT NOT NULL DEFAULT 'pending', posted_at TEXT,
- error_message TEXT, UNIQUE(artifact_id,account_id),
+ error_message TEXT, is_test INTEGER NOT NULL DEFAULT 0, UNIQUE(artifact_id,account_id),
  FOREIGN KEY(media_item_id) REFERENCES media_items(id), FOREIGN KEY(artifact_id) REFERENCES artifacts(id),
  FOREIGN KEY(account_id) REFERENCES tiktok_accounts(id));

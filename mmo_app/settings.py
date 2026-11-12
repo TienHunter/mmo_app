@@ -43,6 +43,8 @@ class Settings:
     ffprobe_path: str = ""
     segment_seconds: int = 60
     split_enabled: bool = True
+    use_vpn_for_youtube: bool = False
+    youtube_cookies_path: str = ""
     output_aspect_ratio: str = "original"
     overlay_text_enabled: bool = False
     overlay_font_path: str = ""
@@ -56,7 +58,16 @@ class Settings:
     tiktok_cdp_url: str = ""
     gpm_api_url: str = DEFAULT_GPM_API_URL
     gpm_reclaim_profile_in_use: bool = True
+    max_download_workers: int = 2
+    max_process_workers: int = 1
     max_upload_workers: int = 1
+    caption_include_title: bool = False
+    caption_include_hashtags: bool = True
+    hashtag_source: str = "fixed"
+    ai_api_url: str = ""
+    ai_api_key: str = ""
+    ai_model: str = ""
+    ai_system_prompt: str = ""
 
     @property
     def database_path(self) -> Path:
