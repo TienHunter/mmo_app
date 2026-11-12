@@ -105,6 +105,8 @@ class Desktop(tk.Tk):
             "rss_interval_seconds": tk.StringVar(value=str(settings.rss_interval_seconds)),
             "download_dir": tk.StringVar(value=settings.download_dir),
             "output_dir": tk.StringVar(value=settings.output_dir),
+            "use_vpn_for_youtube": tk.BooleanVar(value=settings.use_vpn_for_youtube),
+            "youtube_cookies_path": tk.StringVar(value=settings.youtube_cookies_path),
             "output_aspect_ratio": tk.StringVar(value=settings.output_aspect_ratio),
             "video_zoom_factor": tk.DoubleVar(value=max(0.0, min(3.0, (settings.video_zoom_percent if settings.video_zoom_percent is not None else 100) / 100))),
             "video_zoom_label": tk.StringVar(value=""),
@@ -126,6 +128,7 @@ class Desktop(tk.Tk):
             ("Thư mục tải video", "download_dir"), ("Thư mục video đã xử lý", "output_dir"),
             ("Speed toàn app", "video_speed"),
             ("GPM API URL", "gpm_api_url"),
+            ("Cookie YouTube (.txt, dùng khi bật VPN)", "youtube_cookies_path"),
             ("Font chữ (.ttf/.otf, bỏ trống dùng Arial)", "overlay_font_path"),
             ("Màu chữ (white hoặc #RRGGBB)", "overlay_font_color"),
             ("Cỡ chữ", "overlay_font_size"),
@@ -176,9 +179,11 @@ class Desktop(tk.Tk):
         ttk.Checkbutton(form, text="Chèn title phía trên và Part phía dưới video", variable=self.variables["overlay_text_enabled"]).grid(row=controls_row, column=1, sticky="w", padx=4, pady=7)
         ttk.Checkbutton(form, text="Cho phép click Đăng TikTok (tác vụ có tác động công khai)", variable=self.variables["tiktok_publish_enabled"]).grid(row=controls_row + 1, column=1, sticky="w", padx=4, pady=7)
         ttk.Checkbutton(form, text="GPM ProfileInUse: tự đóng profile và mở lại bằng app", variable=self.variables["gpm_reclaim_profile_in_use"]).grid(row=controls_row + 2, column=1, sticky="w", padx=4, pady=7)
-        ttk.Button(form, text="Chọn font…", command=self._choose_font).grid(row=controls_row + 3, column=0, sticky="w", padx=4, pady=10)
-        ttk.Button(form, text="Lưu cấu hình", command=self._save_settings).grid(row=controls_row + 3, column=1, sticky="w", padx=4, pady=10)
-        ttk.Button(form, text="Mở thư mục dữ liệu", command=lambda: os.startfile(settings.data_dir)).grid(row=controls_row + 3, column=1, sticky="e", padx=4, pady=10)
+        ttk.Checkbutton(form, text="Sử dụng VPN khi tải YouTube", variable=self.variables["use_vpn_for_youtube"]).grid(row=controls_row + 3, column=1, sticky="w", padx=4, pady=7)
+        ttk.Button(form, text="Chọn cookie…", command=self._choose_youtube_cookies).grid(row=controls_row + 4, column=0, sticky="w", padx=4, pady=10)
+        ttk.Button(form, text="Chọn font…", command=self._choose_font).grid(row=controls_row + 4, column=1, sticky="w", padx=4, pady=10)
+        ttk.Button(form, text="Lưu cấu hình", command=self._save_settings).grid(row=controls_row + 4, column=1, sticky="e", padx=4, pady=10)
+        ttk.Button(form, text="Mở thư mục dữ liệu", command=lambda: os.startfile(settings.data_dir)).grid(row=controls_row + 4, column=0, sticky="e", padx=4, pady=10)
         form.columnconfigure(1, weight=1)
 
     def _save_settings(self) -> None:
@@ -206,6 +211,13 @@ class Desktop(tk.Tk):
             value.output_aspect_ratio = self.variables["output_aspect_ratio"].get()
             value.gpm_api_url = self.variables["gpm_api_url"].get().strip() or DEFAULT_GPM_API_URL
             value.gpm_reclaim_profile_in_use = bool(self.variables["gpm_reclaim_profile_in_use"].get())
+            value.use_vpn_for_youtube = bool(self.variables["use_vpn_for_youtube"].get())
+            value.youtube_cookies_path = self.variables["youtube_cookies_path"].get().strip()
+            if value.use_vpn_for_youtube:
+                if not value.youtube_cookies_path:
+                    raise ValueError("Bật VPN thì phải chọn file cookies YouTube")
+                if not os.path.isfile(value.youtube_cookies_path):
+                    raise ValueError("Không tìm thấy file cookies YouTube đã chọn")
             value.overlay_text_enabled = bool(self.variables["overlay_text_enabled"].get())
             value.overlay_font_path = self.variables["overlay_font_path"].get().strip()
             if value.overlay_font_path and not os.path.isfile(value.overlay_font_path):
@@ -224,6 +236,14 @@ class Desktop(tk.Tk):
     def _choose_font(self) -> None:
         path = filedialog.askopenfilename(title="Chọn font chữ", filetypes=[("Font", "*.ttf *.otf"), ("Tất cả file", "*.*")])
         if path: self.variables["overlay_font_path"].set(path)
+
+    def _choose_youtube_cookies(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Chọn cookies YouTube",
+            filetypes=[("Text cookies", "*.txt"), ("Tất cả file", "*.*")],
+        )
+        if path:
+            self.variables["youtube_cookies_path"].set(path)
 
     def _update_zoom_label(self) -> None:
         factor = max(0.0, min(3.0, float(self.variables["video_zoom_factor"].get())))

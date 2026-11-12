@@ -4,10 +4,13 @@ import tempfile
 import unittest
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 import json
 import sys
 import types
+import threading
 from pathlib import Path
+from unittest import mock
 from zipfile import ZipFile
 
 from mmo_app.application import Application
@@ -15,8 +18,9 @@ from mmo_app.database import Database
 from mmo_app.desktop import Desktop
 from mmo_app.reporting import build_pipeline_report_rows, export_pipeline_report
 from mmo_app import services
-from mmo_app.services import DownloadHandler, GpmLoginClient, ManualAction, ProcessHandler, UploadHandler, YouTubeService
+from mmo_app.services import DownloadHandler, GpmLoginClient, ManualAction, PipelineOrchestrator, ProcessHandler, TikTokBrowserOutOfMemory, UploadHandler, YouTubeService
 from mmo_app.settings import DEFAULT_GPM_API_URL, Settings
+from mmo_app.ui.services.repository import UIRepository, format_local_time
 from mmo_app.websub import WebSubService
 
 
@@ -45,6 +49,26 @@ class PipelineDatabaseTests(unittest.TestCase):
     def test_log_time_is_displayed_in_local_timezone(self):
         self.assertEqual("2026-07-26 20:53:02", Desktop.format_log_time("2026-07-26T13:53:02+00:00"))
         self.assertEqual("2026-07-26 20:53:02", Desktop.format_log_time("2026-07-26 13:53:02"))
+
+    def test_ui_time_is_displayed_in_utc_plus_7(self):
+        self.assertEqual(
+            "2026-07-26 20:53:02",
+            format_local_time("2026-07-26T13:53:02+00:00"),
+        )
+        self.assertEqual(
+            "20:53:02",
+            format_local_time("2026-07-26T13:53:02+00:00", include_date=False),
+        )
+        self.assertEqual(
+            "2026-07-26 20:53:02",
+            format_local_time("2026-07-26 13:53:02"),
+        )
+        self.assertEqual("", format_local_time(None))
+
+    def test_default_pipeline_worker_counts(self):
+        self.assertEqual(2, self.settings.max_download_workers)
+        self.assertEqual(1, self.settings.max_process_workers)
+        self.assertEqual(1, self.settings.max_upload_workers)
 
     def test_retry_and_recovery(self):
         service = YouTubeService(self.db, self.settings); service.discover("12345678901", "UCtest", "Demo")
@@ -94,6 +118,103 @@ class PipelineDatabaseTests(unittest.TestCase):
                 sys.modules["yt_dlp"] = original_module
 
         self.assertEqual(self.settings.ffmpeg_path, captured_options["ffmpeg_location"])
+
+    def test_download_propagates_test_payload_to_process_job(self):
+        output_path = Path(self.settings.download_dir) / "test-account" / "Downloaded [testjob0001].mp4"
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download=True):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"mp4")
+                return {"id": "testjob0001", "title": "Downloaded", "ext": "mp4"}
+
+            def prepare_filename(self, info):
+                return str(output_path)
+
+        original_module = sys.modules.get("yt_dlp")
+        original_bell = services.play_notification_bell
+        sys.modules["yt_dlp"] = types.SimpleNamespace(YoutubeDL=FakeYoutubeDL)
+        services.play_notification_bell = lambda *_args, **_kwargs: True
+        try:
+            with self.db.connect() as connection:
+                account_id = connection.execute(
+                    "INSERT INTO tiktok_accounts(name) VALUES ('Test')").lastrowid
+                media_id = connection.execute(
+                    """INSERT INTO media_items(youtube_video_id,channel_id,title,source_url)
+                       VALUES ('testjob0001','test_account_1','Downloaded','https://www.youtube.com/watch?v=testjob0001')"""
+                ).lastrowid
+            job_id = self.db.enqueue(
+                "download", media_id, "download:testjob0001",
+                json.dumps({"test_account_id": account_id, "is_test": 1}))
+            with self.db.connect() as connection:
+                job = connection.execute(
+                    "SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            DownloadHandler(self.db, self.settings).run(job)
+        finally:
+            services.play_notification_bell = original_bell
+            if original_module is None:
+                sys.modules.pop("yt_dlp", None)
+            else:
+                sys.modules["yt_dlp"] = original_module
+        with self.db.connect() as connection:
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE kind='process' ORDER BY id DESC LIMIT 1").fetchone()
+        payload = json.loads(job["payload"])
+        self.assertEqual(1, payload["is_test"])
+        self.assertEqual(account_id, payload["test_account_id"])
+        self.assertIn("artifact_id", payload)
+
+    def test_download_uses_cookiefile_when_vpn_mode_is_enabled(self):
+        captured_options = {}
+        output_path = Path(self.settings.download_dir) / "UCtest" / "Downloaded [cookie00001].mp4"
+        cookies_path = Path(self.temp.name) / "cookies.txt"
+        cookies_path.write_text("dummy", encoding="utf-8")
+        self.settings.use_vpn_for_youtube = True
+        self.settings.youtube_cookies_path = str(cookies_path)
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                captured_options.update(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def extract_info(self, url, download=True):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"mp4")
+                return {"id": "cookie00001", "title": "Downloaded", "ext": "mp4"}
+
+            def prepare_filename(self, info):
+                return str(output_path)
+
+        original_module = sys.modules.get("yt_dlp")
+        sys.modules["yt_dlp"] = types.SimpleNamespace(YoutubeDL=FakeYoutubeDL)
+        try:
+            with self.db.connect() as connection:
+                media_id = connection.execute(
+                    """INSERT INTO media_items(youtube_video_id,channel_id,title,source_url)
+                       VALUES ('cookie00001','UCtest','Downloaded','https://www.youtube.com/watch?v=cookie00001')"""
+                ).lastrowid
+            DownloadHandler(self.db, self.settings).run({"media_item_id": media_id})
+        finally:
+            if original_module is None:
+                sys.modules.pop("yt_dlp", None)
+            else:
+                sys.modules["yt_dlp"] = original_module
+
+        self.assertEqual(str(cookies_path), captured_options["cookiefile"])
 
     def test_download_skips_video_when_orientation_filter_does_not_match(self):
         self.settings.source_orientation_filter = "portrait"
@@ -270,6 +391,26 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual(1080, box.video_width)
         self.assertEqual(910, box.video_height)
 
+    def test_independent_height_zoom_stretches_vertical_only(self):
+        filter_text = ProcessHandler.video_filter("9:16", 100, 140)
+        self.assertIn(
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "scale=trunc(iw*1/2)*2:trunc(ih*1.4/2)*2",
+            filter_text,
+        )
+        box = ProcessHandler.scaled_video_box((1920, 1080), "9:16", 100, 140)
+        self.assertEqual(1080, box.video_width)
+        self.assertGreater(box.video_height, 606)
+        self.assertLess(box.video_height, 1920)
+        width_box = ProcessHandler.scaled_video_box((1920, 1080), "9:16", 150, 100)
+        self.assertEqual(606, width_box.video_height)
+        self.assertGreaterEqual(width_box.video_width, 1080)
+
+    def test_caption_above_video_uses_rounded_font(self):
+        handler = ProcessHandler(self.db, self.settings)
+        font = handler.caption_font("Tiêu đề tiếng Việt", 56)
+        self.assertIsNotNone(font)
+
     def test_zoom_factor_can_go_down_to_zero(self):
         filter_text = ProcessHandler.video_filter("9:16", 0)
         self.assertIn("scale=2:2:force_original_aspect_ratio=decrease", filter_text)
@@ -277,27 +418,67 @@ class PipelineDatabaseTests(unittest.TestCase):
         options = ProcessHandler(self.db, self.settings)._processing_options(None)
         self.assertEqual(0, options.zoom_percent)
 
-    def test_short_final_segment_is_merged_into_previous_part(self):
-        self.assertEqual(
-            [(0.0, 60.0), (60.0, 70.0)],
-            ProcessHandler.segment_ranges(130, 60),
-        )
-        self.assertEqual(
-            [(0.0, 60.0), (60.0, 31.0)],
-            ProcessHandler.segment_ranges(91, 60),
-        )
-        self.assertEqual(
-            [(0.0, 89.0)],
-            ProcessHandler.segment_ranges(89, 60),
-        )
-        accelerated_ranges = ProcessHandler.segment_ranges(91 / 1.1, 33)
-        self.assertEqual(2, len(accelerated_ranges))
-        self.assertAlmostEqual(33.0, accelerated_ranges[0][1], places=2)
-        self.assertAlmostEqual((91 / 1.1) - 33, accelerated_ranges[1][1], places=2)
+    def test_download_start_plays_account_notification_sound(self):
+        with self.db.connect() as connection:
+            connection.execute("INSERT INTO channels(channel_id) VALUES ('UCbell')")
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name,notification_sound) VALUES ('TikTok','bell.wav')"
+            ).lastrowid
+            route_id = connection.execute(
+                "INSERT INTO channel_routes(name,account_id) VALUES ('Layout',?)", (account_id,)
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO channel_route_sources(route_id,channel_id,source_url) VALUES (?,?,?)",
+                (route_id, "UCbell", "https://youtube.com/@bell"),
+            )
+        played = []
+        original = services.play_notification_bell
+        try:
+            services.play_notification_bell = lambda path="", ffmpeg_binary="ffmpeg": played.append(path) or True
+            DownloadHandler(self.db, self.settings)._notify_download_started(None, "UCbell", "Bell demo")
+        finally:
+            services.play_notification_bell = original
+        self.assertEqual(["bell.wav"], played)
+
+    def test_notification_bell_stops_on_demand(self):
+        bell = services.NotificationBell(duration_seconds=30)
+        with mock.patch("winsound.MessageBeep"), mock.patch("winsound.PlaySound"):
+            self.assertTrue(bell.play("", "ffmpeg"))
+            self.assertTrue(bell.is_playing)
+            bell.stop()
+            self.assertFalse(bell.is_playing)
+            time.sleep(0.05)
+
+    def test_part_count_uses_speed_adjusted_duration_thresholds(self):
+        expected = {
+            299.9: 1,
+            300.0: 2,
+            479.9: 2,
+            480.0: 3,
+            899.9: 3,
+            900.0: 4,
+            1079.9: 4,
+            1080.0: 5,
+            3600.0: 5,
+        }
+        for duration, parts in expected.items():
+            self.assertEqual(parts, ProcessHandler.part_count_for_duration(duration))
+
+    def test_parts_have_slight_length_difference_and_absorb_remainder(self):
+        ranges = ProcessHandler.segment_ranges_for_parts(1000.0, 4)
+        self.assertEqual(4, len(ranges))
+        lengths = [length for _, length in ranges]
+        self.assertAlmostEqual(1000.0, sum(lengths), places=6)
+        self.assertGreater(len(set(round(length, 3) for length in lengths)), 1)
+        self.assertEqual(4, len(set(round(length, 3) for length in lengths)))
+        for length in lengths:
+            self.assertGreaterEqual(length, 250.0 * 0.9)
+            self.assertLessEqual(length, 250.0 * 1.1)
+        self.assertAlmostEqual(ranges[-1][0], sum(lengths[:-1]), places=6)
+        self.assertEqual([(0.0, 42.0)], ProcessHandler.segment_ranges_for_parts(42.0, 1))
 
     def test_process_splits_after_applying_speed_timeline(self):
-        self.settings.segment_seconds = 33
-        self.settings.video_speed = 1.1
+        self.settings.video_speed = 2.0
         self.settings.split_enabled = True
         source = Path(self.temp.name) / "source.mp4"
         source.write_bytes(b"video")
@@ -315,7 +496,7 @@ class PipelineDatabaseTests(unittest.TestCase):
         original_render = ProcessHandler._render
         original_route_uploads = ProcessHandler._route_uploads
         try:
-            ProcessHandler._duration = lambda _handler, _source: 91.0
+            ProcessHandler._duration = lambda _handler, _source: 600.0
 
             def fake_render(handler, _source, destination, start, length, title="", part=1, total_parts=1, options=None):
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -331,9 +512,131 @@ class PipelineDatabaseTests(unittest.TestCase):
             ProcessHandler._route_uploads = original_route_uploads
 
         self.assertEqual(2, len(calls))
-        self.assertEqual((0.0, 33.0 * 1.1, 1, 2), calls[0])
-        self.assertAlmostEqual(33.0 * 1.1, calls[1][0], places=2)
-        self.assertAlmostEqual((91.0 - 33.0 * 1.1), calls[1][1], places=2)
+        self.assertEqual((0.0, 315.0, 1, 2), calls[0])
+        self.assertAlmostEqual(315.0, calls[1][0], places=2)
+        self.assertAlmostEqual(285.0, calls[1][1], places=2)
+
+    def test_account_split_disabled_forces_single_part(self):
+        self.settings.split_enabled = True
+        source = Path(self.temp.name) / "source.mp4"
+        source.write_bytes(b"video")
+        youtube = YouTubeService(self.db, self.settings)
+        youtube.discover("nosplit0001", "UCnosplit", "No split")
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "SELECT id FROM media_items WHERE youtube_video_id='nosplit0001'").fetchone()["id"]
+            artifact_id = connection.execute(
+                "INSERT INTO artifacts(media_item_id,kind,path) VALUES (?,'downloaded',?)",
+                (media_id, str(source))).lastrowid
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name,split_enabled) VALUES ('No split',0)").lastrowid
+            connection.execute("INSERT INTO channels(channel_id) VALUES ('UCnosplit')")
+            route_id = connection.execute(
+                "INSERT INTO channel_routes(name,account_id) VALUES ('R',?)", (account_id,)).lastrowid
+            connection.execute(
+                "INSERT INTO channel_route_sources(route_id,channel_id,source_url) VALUES (?,?,?)",
+                (route_id, "UCnosplit", "https://youtube.com/@nosplit"))
+            job = {"id": 1, "media_item_id": media_id, "payload": json.dumps({"artifact_id": artifact_id})}
+        calls = []
+        original_duration = ProcessHandler._duration
+        original_render = ProcessHandler._render
+        original_route_uploads = ProcessHandler._route_uploads
+        try:
+            ProcessHandler._duration = lambda _handler, _source: 1200.0
+
+            def fake_render(handler, _source, destination, start, length, title="", part=1, total_parts=1, options=None):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"rendered")
+                calls.append((start, length, part, total_parts))
+
+            ProcessHandler._render = fake_render
+            ProcessHandler._route_uploads = lambda *_args, **_kwargs: None
+            ProcessHandler(self.db, self.settings).run(job)
+        finally:
+            ProcessHandler._duration = original_duration
+            ProcessHandler._render = original_render
+            ProcessHandler._route_uploads = original_route_uploads
+        self.assertEqual([(0.0, None, 1, 1)], calls)
+
+    def test_youtube_video_url_extracts_video_id(self):
+        expected = "dQw4w9WgXcQ"
+        for url in (
+            f"https://www.youtube.com/watch?v={expected}",
+            f"https://youtube.com/watch?v={expected}&t=42",
+            f"https://youtu.be/{expected}?si=abc",
+            f"https://www.youtube.com/shorts/{expected}",
+            f"https://www.youtube.com/live/{expected}",
+        ):
+            self.assertEqual(expected, YouTubeService.video_id_from_url(url))
+        with self.assertRaises(ValueError):
+            YouTubeService.video_id_from_url("https://example.com/watch?v=dQw4w9WgXcQ")
+        with self.assertRaises(ValueError):
+            YouTubeService.video_id_from_url("https://www.youtube.com/watch?v=short")
+
+    def test_queue_test_video_creates_download_job_for_account(self):
+        with self.db.connect() as connection:
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name) VALUES ('Test account')").lastrowid
+        original = YouTubeService.resolve_video_url
+        try:
+            YouTubeService.resolve_video_url = lambda _self, _url: (
+                "dQw4w9WgXcQ", "Test video title", "UCtestchannel")
+            media_id = YouTubeService(self.db, self.settings).queue_test_video(
+                "https://youtu.be/dQw4w9WgXcQ", account_id)
+        finally:
+            YouTubeService.resolve_video_url = original
+        with self.db.connect() as connection:
+            media = connection.execute(
+                "SELECT * FROM media_items WHERE id=?", (media_id,)).fetchone()
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE kind='download' ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual("dQw4w9WgXcQ", media["youtube_video_id"])
+        self.assertEqual("Test video title", media["title"])
+        self.assertEqual(f"test_account_{account_id}", media["channel_id"])
+        payload = json.loads(job["payload"])
+        self.assertEqual(1, payload["is_test"])
+        self.assertEqual(account_id, payload["test_account_id"])
+
+    def test_test_video_routes_to_selected_account_without_upload_job(self):
+        youtube = YouTubeService(self.db, self.settings)
+        youtube.discover("test0000001", "UCtest", "Test route")
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "SELECT id FROM media_items WHERE youtube_video_id='test0000001'").fetchone()["id"]
+            connection.execute(
+                "INSERT INTO artifacts(media_item_id,kind,path,segment_index) VALUES (?,'rendered','test.mp4',1)",
+                (media_id,))
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name,caption_text) VALUES ('Test account','Caption')").lastrowid
+        ProcessHandler(self.db, self.settings)._route_uploads(
+            media_id, "Test route", account_id=account_id, is_test=True)
+        with self.db.connect() as connection:
+            task = connection.execute("SELECT * FROM upload_tasks").fetchone()
+            upload_jobs = connection.execute(
+                "SELECT COUNT(*) AS c FROM jobs WHERE kind='upload'").fetchone()["c"]
+        self.assertEqual(account_id, task["account_id"])
+        self.assertEqual(1, task["is_test"])
+        self.assertEqual("test_ready", task["status"])
+        self.assertEqual(0, upload_jobs)
+
+    def test_upload_handler_never_posts_a_test_task(self):
+        task_id, account_id = self._insert_upload_task()
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE upload_tasks SET is_test=1 WHERE id=?", (task_id,))
+        calls = []
+        original_start = UploadHandler._start_gpm_profile
+        try:
+            UploadHandler._start_gpm_profile = lambda *_args, **_kwargs: calls.append("start")
+            UploadHandler(self.db, self.settings).run(
+                {"payload": f'{{"task_id": {task_id}}}'})
+        finally:
+            UploadHandler._start_gpm_profile = original_start
+        with self.db.connect() as connection:
+            status = connection.execute(
+                "SELECT status FROM upload_tasks WHERE id=?", (task_id,)).fetchone()["status"]
+        self.assertEqual([], calls)
+        self.assertEqual("test_ready", status)
 
     def test_youtube_channel_url_can_resolve_direct_channel_id_without_network(self):
         service = YouTubeService(self.db, self.settings)
@@ -364,7 +667,7 @@ class PipelineDatabaseTests(unittest.TestCase):
             task = connection.execute("SELECT account_id,artifact_id FROM upload_tasks").fetchone()
         self.assertEqual((account_id, artifact_id), (task["account_id"], task["artifact_id"]))
 
-    def test_upload_caption_uses_tiktok_hashtags_only(self):
+    def test_upload_caption_uses_youtube_title_index_and_hashtags(self):
         youtube = YouTubeService(self.db, self.settings)
         youtube.discover("parts000001", "UCparts", "Demo title")
         with self.db.connect() as connection:
@@ -378,7 +681,60 @@ class PipelineDatabaseTests(unittest.TestCase):
         ProcessHandler(self.db, self.settings)._route_uploads(media_id, "Demo title")
         with self.db.connect() as connection:
             captions = [row["caption"] for row in connection.execute("SELECT caption FROM upload_tasks ORDER BY artifact_id")]
-        self.assertEqual(["#viral #review", "#viral #review"], captions)
+        self.assertEqual(
+            ["Demo title (1)\n#viral #review", "Demo title (2)\n#viral #review"],
+            captions,
+        )
+
+    def test_single_part_caption_is_title_without_index(self):
+        with self.db.connect() as connection:
+            connection.execute("INSERT INTO tiktok_accounts(name) VALUES ('TikTok')")
+            account = connection.execute("SELECT * FROM tiktok_accounts").fetchone()
+        handler = ProcessHandler(self.db, self.settings)
+        self.assertEqual(
+            "Demo title",
+            handler._upload_caption("Demo title", 1, account, total_parts=1),
+        )
+
+    def test_fixed_account_caption_uses_caption_text_and_part_suffix(self):
+        with self.db.connect() as connection:
+            connection.execute(
+                """INSERT INTO tiktok_accounts(name,caption_mode,caption_text,hashtags)
+                   VALUES ('TikTok','fixed','Caption cố định','#ignored')"""
+            )
+            account = connection.execute("SELECT * FROM tiktok_accounts").fetchone()
+        handler = ProcessHandler(self.db, self.settings)
+        self.assertEqual(
+            "Caption cố định (2)",
+            handler._upload_caption("Demo title", 2, account, total_parts=2),
+        )
+
+    def test_ai_account_caption_uses_generated_text_and_falls_back(self):
+        with self.db.connect() as connection:
+            connection.execute(
+                """INSERT INTO tiktok_accounts(name,caption_mode,caption_text)
+                   VALUES ('TikTok','ai','Caption dự phòng')"""
+            )
+            account = connection.execute("SELECT * FROM tiktok_accounts").fetchone()
+        handler = ProcessHandler(self.db, self.settings)
+        original = ProcessHandler._generate_caption
+        try:
+            ProcessHandler._generate_caption = lambda _self, title, part=1, account=None, total_parts=1: f"AI caption cho {title}"
+            self.assertEqual(
+                "AI caption cho Demo title (3)",
+                handler._upload_caption("Demo title", 3, account, total_parts=3),
+            )
+
+            def boom(*_args, **_kwargs):
+                raise RuntimeError("AI offline")
+
+            ProcessHandler._generate_caption = boom
+            self.assertEqual(
+                "Caption dự phòng",
+                handler._upload_caption("Demo title", 1, account),
+            )
+        finally:
+            ProcessHandler._generate_caption = original
 
     def test_processor_output_group_uses_mapped_tiktok_channel_name(self):
         with self.db.connect() as connection:
@@ -389,6 +745,197 @@ class PipelineDatabaseTests(unittest.TestCase):
         handler = ProcessHandler(self.db, self.settings)
         self.assertEqual("TikTok_ Main_01", handler._output_group("UCfolder"))
         self.assertEqual("UCunmapped", handler._output_group("UCunmapped"))
+
+    def test_channel_can_be_reassigned_and_deleted(self):
+        with self.db.connect() as connection:
+            first = connection.execute(
+                "INSERT INTO tiktok_accounts(name) VALUES ('First')").lastrowid
+            second = connection.execute(
+                "INSERT INTO tiktok_accounts(name) VALUES ('Second')").lastrowid
+        repository = UIRepository(self.db)
+        repository.save_channel_route(
+            "UCedit", "Edit channel", "https://youtube.com/@edit", first)
+        repository.update_channel_account("UCedit", second)
+        with self.db.connect() as connection:
+            row = connection.execute(
+                """SELECT r.account_id FROM channel_route_sources s
+                   JOIN channel_routes r ON r.id=s.route_id
+                   WHERE s.channel_id='UCedit'"""
+            ).fetchone()
+        self.assertEqual(second, row["account_id"])
+        repository.delete_channel("UCedit")
+        with self.db.connect() as connection:
+            channel = connection.execute(
+                "SELECT 1 FROM channels WHERE channel_id='UCedit'").fetchone()
+            source = connection.execute(
+                "SELECT 1 FROM channel_route_sources WHERE channel_id='UCedit'").fetchone()
+        self.assertIsNone(channel)
+        self.assertIsNone(source)
+
+    def test_pipeline_runs_downloads_in_parallel(self):
+        self.settings.max_download_workers = 2
+        self.settings.max_process_workers = 1
+        self.settings.max_upload_workers = 1
+        media_ids = []
+        with self.db.connect() as connection:
+            for index in range(4):
+                media_ids.append(connection.execute(
+                    """INSERT INTO media_items(youtube_video_id,channel_id,title)
+                       VALUES (?, 'UCparallel', ?)""",
+                    (f"parallel{index:03d}", f"Parallel {index}"),
+                ).lastrowid)
+        for index, media_id in enumerate(media_ids):
+            self.db.enqueue(
+                "download", media_id, f"parallel-download-{index}")
+        state = {"active": 0, "max": 0}
+        state_lock = threading.Lock()
+
+        class FakeDownload:
+            def run(self, _job):
+                with state_lock:
+                    state["active"] += 1
+                    state["max"] = max(state["max"], state["active"])
+                time.sleep(0.3)
+                with state_lock:
+                    state["active"] -= 1
+
+        orchestrator = PipelineOrchestrator(self.db, self.settings)
+        orchestrator.handlers["download"] = FakeDownload()
+        try:
+            orchestrator.start()
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                with self.db.connect() as connection:
+                    completed = connection.execute(
+                        "SELECT COUNT(*) AS c FROM jobs WHERE kind='download' AND status='completed'"
+                    ).fetchone()["c"]
+                if completed >= 4:
+                    break
+                time.sleep(0.05)
+        finally:
+            orchestrator.stop()
+        self.assertEqual(4, completed)
+        self.assertEqual(2, state["max"])
+
+    def test_pipeline_logs_include_video_and_channel(self):
+        with self.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO channels(channel_id,title) VALUES ('UClog','Kênh Log')")
+            media_id = connection.execute(
+                """INSERT INTO media_items(youtube_video_id,channel_id,title,source_url)
+                   VALUES ('logvideo001','UClog','Video Log','https://www.youtube.com/watch?v=logvideo001')"""
+            ).lastrowid
+        job_id = self.db.enqueue("download", media_id, "download:logvideo001")
+        state = {"done": False}
+
+        class FakeDownload:
+            def run(self, _job):
+                state["done"] = True
+
+        orchestrator = PipelineOrchestrator(self.db, self.settings)
+        orchestrator.handlers["download"] = FakeDownload()
+        try:
+            orchestrator.start()
+            deadline = time.time() + 4
+            while time.time() < deadline and not state["done"]:
+                time.sleep(0.05)
+            time.sleep(0.05)
+        finally:
+            orchestrator.stop()
+        with self.db.connect() as connection:
+            messages = [
+                row["message"] for row in connection.execute(
+                    "SELECT message FROM job_events WHERE job_id=? ORDER BY id",
+                    (job_id,))
+            ]
+        self.assertTrue(any("Bắt đầu tải video: Video Log" in m for m in messages))
+        self.assertTrue(any("Kênh: Kênh Log" in m for m in messages))
+        self.assertTrue(any(
+            "Link: https://www.youtube.com/watch?v=logvideo001" in m
+            for m in messages))
+        self.assertTrue(any("Hoàn tất tải video: Video Log" in m for m in messages))
+
+    def test_pipeline_activity_estimates_remaining_time(self):
+        def stamp(seconds_ago: int) -> str:
+            return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "INSERT INTO media_items(youtube_video_id,channel_id,title) VALUES ('eta00000001','UCx','ETA')"
+            ).lastrowid
+            completed_id = connection.execute(
+                """INSERT INTO jobs(kind,media_item_id,idempotency_key,status)
+                   VALUES ('download',?,'eta-completed','completed')""",
+                (media_id,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO job_events(job_id,level,message,created_at) VALUES (?, 'INFO', 'Bắt đầu download', ?)",
+                (completed_id, stamp(200)))
+            connection.execute(
+                "INSERT INTO job_events(job_id,level,message,created_at) VALUES (?, 'INFO', 'Hoàn tất', ?)",
+                (completed_id, stamp(100)))
+            running_id = connection.execute(
+                """INSERT INTO jobs(kind,media_item_id,idempotency_key,status)
+                   VALUES ('download',?,'eta-running','leased')""",
+                (media_id,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO job_events(job_id,level,message,created_at) VALUES (?, 'INFO', 'Bắt đầu download', ?)",
+                (running_id, stamp(20)))
+            second_running = connection.execute(
+                """INSERT INTO jobs(kind,media_item_id,idempotency_key,status)
+                   VALUES ('download',?,'eta-running-2','leased')""",
+                (media_id,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO job_events(job_id,level,message,created_at) VALUES (?, 'INFO', 'Bắt đầu download', ?)",
+                (second_running, stamp(10)))
+        activity = UIRepository(self.db).pipeline_activity()
+        download = next(
+            stage for stage in activity["stages"] if stage["kind"] == "download")
+        self.assertEqual("running", download["state"])
+        self.assertIsNotNone(download["eta_seconds"])
+        self.assertGreaterEqual(download["eta_seconds"], 70)
+        self.assertLessEqual(download["eta_seconds"], 90)
+        self.assertEqual(2, len(download["tasks"]))
+        self.assertEqual("ETA", download["tasks"][0]["title"])
+
+    def test_pipeline_activity_reports_live_stage_states(self):
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "INSERT INTO media_items(youtube_video_id,channel_id,title) VALUES ('activity001','UCx','Video')"
+            ).lastrowid
+            artifact_id = connection.execute(
+                "INSERT INTO artifacts(media_item_id,kind,path) VALUES (?,'rendered','x.mp4')",
+                (media_id,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO jobs(kind,media_item_id,idempotency_key,status) VALUES ('download',?,'activity-d','completed')",
+                (media_id,),
+            )
+            connection.execute(
+                "INSERT INTO jobs(kind,media_item_id,idempotency_key,status) VALUES ('process',?,'activity-p','leased')",
+                (media_id,),
+            )
+            connection.execute(
+                """INSERT INTO jobs(kind,media_item_id,idempotency_key,status,error_message)
+                   VALUES ('upload',?,'activity-u','failed','upload boom')""",
+                (media_id,),
+            )
+            connection.execute(
+                "INSERT INTO job_events(job_id,level,message) VALUES (2,'INFO','Đang xử lý')")
+            connection.execute(
+                "INSERT INTO upload_tasks(media_item_id,artifact_id,account_id,caption) VALUES (?,?,NULL,'x')",
+                (media_id, artifact_id),
+            )
+        activity = UIRepository(self.db).pipeline_activity()
+        stages = {stage["kind"]: stage for stage in activity["stages"]}
+        self.assertEqual("success", stages["download"]["state"])
+        self.assertEqual("running", stages["process"]["state"])
+        self.assertEqual("failed", stages["upload"]["state"])
+        self.assertIn("upload boom", stages["upload"]["detail"])
+        self.assertEqual(1, activity["pending_uploads"])
+        self.assertTrue(activity["events"])
 
     def test_pipeline_report_exports_excel_rows(self):
         with self.db.connect() as connection:
@@ -442,23 +989,32 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertIn("TikTok A", sheet)
         self.assertIn("https://youtube.com/@a", rels)
 
-    def test_title_and_part_overlay_filters_use_utf8_text_files(self):
+    def test_caption_overlay_is_white_plate_with_black_text_on_top_of_video(self):
         self.settings.overlay_text_enabled = True
-        self.settings.overlay_font_color = "#ffcc00"
         self.settings.overlay_font_size = 64
         destination = Path(self.temp.name) / "001.mp4"
         video_box = services.VideoBox(1080, 1920, 1080, 608, 0, 656)
-        filters, files = ProcessHandler(self.db, self.settings).overlay_filters(destination, "Tiêu đề tiếng Việt", 2, 3, video_box)
-        self.assertEqual(2, len(filters))
-        self.assertIn("fontcolor=#ffcc00", filters[0])
+        handler = ProcessHandler(self.db, self.settings)
+        text = handler.caption_overlay_text("Tiêu đề tiếng Việt", 2, 3)
+        self.assertEqual("Tiêu đề tiếng Việt (2)", text)
+        image_path, x, y = handler.caption_overlay_image(destination, text, "9:16", video_box)
+        self.assertTrue(image_path.is_file())
+        self.assertGreater(image_path.stat().st_size, 0)
+        self.assertGreaterEqual(x, 0)
+        from PIL import Image
+        with Image.open(image_path) as plate:
+            plate_height = plate.height
+        self.assertEqual(max(307, 656 - plate_height - 8), y)
+        self.assertLess(y, 656)
+        filters, files = handler.overlay_filters(destination, "Tiêu đề tiếng Việt", 2, 3, video_box)
+        self.assertEqual(1, len(filters))
+        self.assertIn("fontcolor=black", filters[0])
         self.assertIn("fontsize=64", filters[0])
         self.assertIn("box=1", filters[0])
-        self.assertIn("boxcolor=black@0.55", filters[0])
-        self.assertIn("boxborderw=24", filters[0])
-        self.assertIn(r"y=max(24\,656-text_h-24)", filters[0])
-        self.assertIn(r"y=min(h-text_h-24\,1264+24)", filters[1])
-        self.assertEqual("Tiêu đề tiếng Việt", files[0].read_text(encoding="utf-8"))
-        self.assertEqual("Part 2", files[1].read_text(encoding="utf-8"))
+        self.assertIn("boxcolor=white", filters[0])
+        self.assertIn("boxborderw=8", filters[0])
+        self.assertIn(r"y=max(307\,656-text_h-8)", filters[0])
+        self.assertEqual("Tiêu đề tiếng Việt (2)", files[0].read_text(encoding="utf-8"))
 
     def test_scaled_video_box_tracks_original_video_inside_vertical_canvas(self):
         box = ProcessHandler.scaled_video_box((1920, 1080), "9:16", 100)
@@ -481,10 +1037,13 @@ class PipelineDatabaseTests(unittest.TestCase):
             ProcessHandler(self.db, self.settings)._render(source, destination, 0, 60, "Title", 2, 2)
         finally:
             services.subprocess.run = original
-        self.assertEqual(1, len(calls))
-        command_text = ",".join(calls[0])
-        self.assertIn("drawtext=", command_text)
-        self.assertIn(".part.txt", command_text)
+        ffmpeg_calls = [command for command in calls if any("caption.png" in str(item) for item in command)]
+        self.assertEqual(1, len(ffmpeg_calls))
+        command_text = ",".join(ffmpeg_calls[0])
+        self.assertIn("-filter_complex", command_text)
+        self.assertIn(".caption.png", command_text)
+        self.assertIn("overlay=", command_text)
+        self.assertFalse(any(".caption.png" in str(item) for item in Path(self.temp.name).glob("*")))
 
     def test_existing_output_without_filters_is_skipped(self):
         source = Path(self.temp.name) / "source.mp4"
@@ -495,17 +1054,27 @@ class PipelineDatabaseTests(unittest.TestCase):
         original = services.subprocess.run
         try:
             services.subprocess.run = lambda command, **kwargs: calls.append(command)
-            ProcessHandler(self.db, self.settings)._render(source, destination, 0, None, "Title", 1, 1)
+            ProcessHandler(self.db, self.settings)._render(
+                source, destination, 0, None, "Title", 1, 1,
+                services.ProcessingOptions(60, "original", 100, 1.0, ""),
+            )
         finally:
             services.subprocess.run = original
         self.assertEqual([], calls)
 
-    def test_channel_processing_options_only_override_segment_and_background(self):
+    def test_account_processing_options_drive_speed_zoom_and_output(self):
         self.settings.video_zoom_percent = 91
         self.settings.video_speed = 1.75
         with self.db.connect() as connection:
             connection.execute("INSERT INTO channels(channel_id) VALUES ('UCoptions')")
-            account_id = connection.execute("INSERT INTO tiktok_accounts(name) VALUES ('TikTok')").lastrowid
+            account_id = connection.execute(
+                """INSERT INTO tiktok_accounts(
+                     name,speed,zoom_width_percent,zoom_height_percent,caption_mode,caption_text,
+                     output_dir,notification_sound,split_enabled,overlay_enabled,
+                     background_path,publish_enabled,ai_api_url,ai_model)
+                   VALUES ('TikTok',1.5,82,70,'ai','fixed caption','D:/out','bell.wav',
+                           1,1,'account-bg.mp4',1,'https://ai.example/v1/chat','gpt-test')"""
+            ).lastrowid
             route_id = connection.execute("INSERT INTO channel_routes(name,account_id) VALUES ('Layout',?)", (account_id,)).lastrowid
             connection.execute(
                 """INSERT INTO channel_route_sources(route_id,channel_id,source_url,segment_seconds,zoom_percent,speed,background_path)
@@ -513,10 +1082,83 @@ class PipelineDatabaseTests(unittest.TestCase):
                 (route_id, "UCoptions", "https://youtube.com/@options", 45, 82, 1.5, "bg.mp4"),
             )
         options = ProcessHandler(self.db, self.settings)._processing_options("UCoptions")
-        self.assertEqual(45, options.segment_seconds)
-        self.assertEqual(91, options.zoom_percent)
-        self.assertEqual(1.75, options.speed)
-        self.assertEqual("bg.mp4", options.background_path)
+        self.assertEqual("9:16", options.aspect_ratio)
+        self.assertEqual(1.5, options.speed)
+        self.assertEqual((82, 70), options.zoom_pair())
+        self.assertEqual("account-bg.mp4", options.background_path)
+        self.assertEqual(account_id, options.account_id)
+        self.assertEqual("D:/out", options.output_dir)
+        self.assertEqual("ai", options.caption_mode)
+        self.assertEqual("fixed caption", options.caption_text)
+        self.assertEqual("bell.wav", options.notification_sound)
+        self.assertTrue(options.split_enabled)
+        self.assertTrue(options.overlay_enabled)
+        self.assertEqual(
+            Path("D:/out") / "Demo title_2.mp4",
+            ProcessHandler.output_path(Path(options.output_dir), "Demo title", 2),
+        )
+
+    def test_inactive_account_still_drives_processing_but_not_uploads(self):
+        with self.db.connect() as connection:
+            connection.execute("INSERT INTO channels(channel_id) VALUES ('UCpaused')")
+            account_id = connection.execute(
+                """INSERT INTO tiktok_accounts(name,active,speed,output_dir)
+                   VALUES ('Paused',0,1.4,'D:/paused-out')"""
+            ).lastrowid
+            route_id = connection.execute(
+                "INSERT INTO channel_routes(name,account_id) VALUES ('R',?)", (account_id,)
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO channel_route_sources(route_id,channel_id,source_url) VALUES (?,?,?)",
+                (route_id, "UCpaused", "https://youtube.com/@paused"))
+        options = ProcessHandler(self.db, self.settings)._processing_options("UCpaused")
+        self.assertEqual(account_id, options.account_id)
+        self.assertEqual(1.4, options.speed)
+        self.assertEqual("D:/paused-out", options.output_dir)
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "INSERT INTO media_items(youtube_video_id,channel_id,title) VALUES ('paused00001','UCpaused','Paused')"
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO artifacts(media_item_id,kind,path,segment_index) VALUES (?,'rendered','paused.mp4',1)",
+                (media_id,))
+        ProcessHandler(self.db, self.settings)._route_uploads(media_id, "Paused")
+        with self.db.connect() as connection:
+            tasks = connection.execute(
+                "SELECT COUNT(*) AS c FROM upload_tasks").fetchone()["c"]
+        self.assertEqual(0, tasks)
+
+    def test_null_account_flags_inherit_global_settings(self):
+        self.settings.split_enabled = False
+        self.settings.overlay_text_enabled = True
+        with self.db.connect() as connection:
+            connection.execute("INSERT INTO channels(channel_id) VALUES ('UCinherit')")
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name) VALUES ('Inherit')").lastrowid
+            route_id = connection.execute(
+                "INSERT INTO channel_routes(name,account_id) VALUES ('R',?)", (account_id,)).lastrowid
+            connection.execute(
+                "INSERT INTO channel_route_sources(route_id,channel_id,source_url) VALUES (?,?,?)",
+                (route_id, "UCinherit", "https://youtube.com/@inherit"))
+        options = ProcessHandler(self.db, self.settings)._processing_options("UCinherit")
+        self.assertFalse(options.split_enabled)
+        self.assertTrue(options.overlay_enabled)
+
+    def test_account_ai_config_overrides_global_and_blank_inherits(self):
+        self.settings.ai_api_url = "https://global.example/v1/chat"
+        self.settings.ai_api_key = "global-key"
+        self.settings.ai_model = "global-model"
+        with self.db.connect() as connection:
+            account_id = connection.execute(
+                """INSERT INTO tiktok_accounts(name,ai_api_url,ai_api_key,ai_model)
+                   VALUES ('AI','https://account.example/v1/chat','','account-model')"""
+            ).lastrowid
+            account = connection.execute(
+                "SELECT * FROM tiktok_accounts WHERE id=?", (account_id,)).fetchone()
+        handler = ProcessHandler(self.db, self.settings)
+        self.assertEqual("https://account.example/v1/chat", handler._ai_value(account, "ai_api_url"))
+        self.assertEqual("global-key", handler._ai_value(account, "ai_api_key"))
+        self.assertEqual("account-model", handler._ai_value(account, "ai_model"))
 
     def test_zoom_out_and_speed_are_applied_to_ffmpeg_command(self):
         source = Path(self.temp.name) / "source.mp4"
@@ -621,6 +1263,57 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertIn(("start", None), fake_websub.calls)
         self.assertIn(("renew_due", True), fake_websub.calls)
         app.shutdown()
+
+    def test_application_does_not_spawn_duplicate_websub_subscribe_threads(self):
+        self.settings.public_domain = "https://example.com"
+        self.settings.tracking_mode = "websub"
+        app = Application(self.settings)
+        with app.database.connect() as connection:
+            connection.execute("INSERT INTO channels(channel_id,active,subscription_status) VALUES ('UCforce',1,'subscribed')")
+            account_id = connection.execute("INSERT INTO tiktok_accounts(name) VALUES ('TikTok')").lastrowid
+            connection.execute("INSERT INTO channel_routes(name,account_id,active) VALUES ('Layout',?,1)", (account_id,))
+
+        release = threading.Event()
+
+        class FakeWebSub:
+            def __init__(self):
+                self.renew_calls = 0
+                self.force_calls = 0
+
+            def start(self):
+                pass
+
+            def renew_due(self, force=False):
+                self.renew_calls += 1
+                if force:
+                    self.force_calls += 1
+                release.wait(1)
+                return 1
+
+            def stop(self):
+                pass
+
+        class FakePipeline:
+            def __init__(self):
+                self.pause_event = type("Pause", (), {"is_set": lambda _self: False})()
+                self.thread = type("Thread", (), {"is_alive": lambda _self: True})()
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        app.websub = FakeWebSub()
+        app.pipeline = FakePipeline()
+        try:
+            app.start()
+            app.start()
+            time.sleep(0.05)
+            self.assertEqual(1, app.websub.force_calls)
+        finally:
+            release.set()
+            app.shutdown()
 
     def test_gpm_cdp_url_is_extracted_from_common_api_shapes(self):
         self.assertEqual(
@@ -828,11 +1521,14 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.settings.tiktok_publish_enabled = True
         task_id, account_id = self._insert_upload_task(daily_limit=0, posts_today=99, counter_date=None)
         original = UploadHandler._playwright_upload
+        original_start = UploadHandler._start_gpm_profile
         try:
+            UploadHandler._start_gpm_profile = lambda handler, profile_id, account_id, job_id=None: "http://127.0.0.1:45678"
             UploadHandler._playwright_upload = staticmethod(lambda path, caption, cdp_url, log=None: None)
             UploadHandler(self.db, self.settings).run({"payload": f'{{"task_id": {task_id}}}'})
         finally:
             UploadHandler._playwright_upload = original
+            UploadHandler._start_gpm_profile = original_start
         with self.db.connect() as connection:
             account = connection.execute("SELECT posts_today,counter_date FROM tiktok_accounts WHERE id=?", (account_id,)).fetchone()
         self.assertEqual(1, account["posts_today"])
@@ -842,15 +1538,50 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.settings.tiktok_publish_enabled = True
         task_id, account_id = self._insert_upload_task(daily_limit=1, posts_today=1, counter_date="2000-01-01")
         original = UploadHandler._playwright_upload
+        original_start = UploadHandler._start_gpm_profile
         try:
+            UploadHandler._start_gpm_profile = lambda handler, profile_id, account_id, job_id=None: "http://127.0.0.1:45678"
             UploadHandler._playwright_upload = staticmethod(lambda path, caption, cdp_url, log=None: None)
             UploadHandler(self.db, self.settings).run({"payload": f'{{"task_id": {task_id}}}'})
         finally:
             UploadHandler._playwright_upload = original
+            UploadHandler._start_gpm_profile = original_start
         with self.db.connect() as connection:
             account = connection.execute("SELECT posts_today,counter_date FROM tiktok_accounts WHERE id=?", (account_id,)).fetchone()
         self.assertEqual(1, account["posts_today"])
         self.assertNotEqual("2000-01-01", account["counter_date"])
+
+    def test_account_publish_flag_overrides_global(self):
+        self.settings.tiktok_publish_enabled = False
+        task_id, account_id = self._insert_upload_task()
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE tiktok_accounts SET publish_enabled=1,gpm_profile_id='p' WHERE id=?",
+                (account_id,),
+            )
+        original = UploadHandler._playwright_upload
+        original_start = UploadHandler._start_gpm_profile
+        try:
+            UploadHandler._start_gpm_profile = lambda handler, profile_id, account_id, job_id=None: "http://127.0.0.1:45678"
+            UploadHandler._playwright_upload = staticmethod(lambda path, caption, cdp_url, log=None: None)
+            UploadHandler(self.db, self.settings).run({"payload": f'{{"task_id": {task_id}}}'})
+        finally:
+            UploadHandler._playwright_upload = original
+            UploadHandler._start_gpm_profile = original_start
+        with self.db.connect() as connection:
+            status = connection.execute(
+                "SELECT status FROM upload_tasks WHERE id=?", (task_id,)).fetchone()["status"]
+        self.assertEqual("completed", status)
+
+    def test_account_publish_disabled_blocks_global_true(self):
+        self.settings.tiktok_publish_enabled = True
+        task_id, account_id = self._insert_upload_task()
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE tiktok_accounts SET publish_enabled=0 WHERE id=?", (account_id,))
+        with self.assertRaisesRegex(ManualAction, "Cho phép đăng TikTok"):
+            UploadHandler(self.db, self.settings).run(
+                {"payload": f'{{"task_id": {task_id}}}'})
 
     def test_tiktok_secondary_post_confirmation_is_accepted(self):
         original_click = UploadHandler._human_click
@@ -1037,10 +1768,23 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual([(60.0, 45.0)], page.mouse.clicks)
         self.assertFalse(locator.clicked)
 
-    def test_tiktok_wait_video_ready_accepts_check_circle_icon(self):
+    def test_tiktok_wait_video_ready_accepts_check_circle_then_post_button(self):
         class FakePost:
+            def __init__(self):
+                self.calls = 0
+
             def wait_for(self, **kwargs):
-                raise RuntimeError("post not ready yet")
+                self.calls += 1
+                if self.calls < 2:
+                    raise RuntimeError("post not ready yet")
+
+            def is_enabled(self, **kwargs):
+                return True
+
+            def get_attribute(self, name, **kwargs):
+                if name in {"aria-disabled", "data-disabled", "data-loading"}:
+                    return "false"
+                return None
 
         class FakeIcon:
             @property
@@ -1066,9 +1810,98 @@ class PipelineDatabaseTests(unittest.TestCase):
 
         logs = []
         page = FakePage()
-        self.assertTrue(UploadHandler._wait_for_tiktok_video_ready(page, FakePost(), timeout=2_000, log=logs.append))
+        post = FakePost()
+        self.assertTrue(UploadHandler._wait_for_tiktok_video_ready(page, post, timeout=2_000, log=logs.append))
         self.assertEqual('[data-testid="CheckCircleFill"]', page.selectors[0])
-        self.assertIn("TikTok: video đã xử lý xong (CheckCircleFill)", logs)
+        self.assertIn("TikTok: video đã xử lý xong (CheckCircleFill), đang chờ nút Post sẵn sàng", logs)
+        self.assertIn("TikTok: video đã xử lý xong và nút Post đã sẵn sàng", logs)
+
+    def test_tiktok_wait_video_ready_detects_browser_out_of_memory(self):
+        class FakePost:
+            def wait_for(self, **kwargs):
+                raise RuntimeError("post not ready")
+
+        class FakeBody:
+            def inner_text(self, **kwargs):
+                return "Aw, Snap! Something went wrong while displaying this webpage. Out of memory."
+
+        class FakePage:
+            url = "https://www.tiktok.com/tiktokstudio/upload"
+
+            def locator(self, selector):
+                return FakeBody()
+
+        with self.assertRaises(TikTokBrowserOutOfMemory):
+            UploadHandler._wait_for_tiktok_video_ready(FakePage(), FakePost(), timeout=1_000)
+
+    def test_tiktok_crash_monitor_marks_page_crash(self):
+        callbacks = {}
+
+        class FakePage:
+            def on(self, event, callback):
+                callbacks[event] = callback
+
+        logs = []
+        state = UploadHandler._attach_tiktok_crash_monitor(FakePage(), log=logs.append)
+        callbacks["crash"]()
+        self.assertTrue(state["crashed"])
+        self.assertTrue(UploadHandler._page_has_tiktok_browser_oom(FakePage(), state))
+        self.assertIn("TikTok: Chrome báo page crash, app sẽ reload tab upload", logs)
+
+    def test_tiktok_post_button_prefers_data_e2e_selector(self):
+        class FakeButton:
+            @property
+            def first(self):
+                return self
+
+            def wait_for(self, **kwargs):
+                self.wait_kwargs = kwargs
+
+        class FakePage:
+            def __init__(self):
+                self.button = FakeButton()
+                self.selectors = []
+
+            def locator(self, selector):
+                self.selectors.append(selector)
+                return self.button
+
+        page = FakePage()
+        self.assertIs(page.button, UploadHandler._find_tiktok_post_button(page))
+        self.assertEqual('button[data-e2e="post_video_button"][data-disabled="false"]', page.selectors[0])
+
+    def test_tiktok_upload_closes_only_stale_upload_pages(self):
+        class FakePage:
+            def __init__(self, url):
+                self.url = url
+                self.closed = False
+                self.blank = False
+
+            def goto(self, url, **kwargs):
+                self.blank = url == "about:blank"
+
+            def close(self):
+                self.closed = True
+
+            def is_closed(self):
+                return self.closed
+
+        class FakeContext:
+            def __init__(self):
+                self.pages = [
+                    FakePage("https://www.tiktok.com/tiktokstudio/upload"),
+                    FakePage("https://www.tiktok.com/@demo"),
+                    FakePage("https://www.tiktok.com/upload"),
+                ]
+
+        logs = []
+        context = FakeContext()
+        self.assertEqual(2, UploadHandler._close_stale_tiktok_upload_pages(context, log=logs.append))
+        self.assertTrue(context.pages[0].closed)
+        self.assertTrue(context.pages[0].blank)
+        self.assertFalse(context.pages[1].closed)
+        self.assertTrue(context.pages[2].closed)
+        self.assertIn("TikTok: đã dọn 2 tab upload cũ để tránh lỗi out of memory", logs)
 
     def test_tiktok_caption_selects_first_hashtag_suggestion(self):
         original_click = UploadHandler._human_click
@@ -1119,6 +1952,45 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual(2, len(clicks))
         self.assertIn("TikTok: đã chọn hashtag #tik", logs)
         self.assertIn("TikTok: đã chọn hashtag #viral", logs)
+
+    def test_tiktok_caption_types_title_before_hashtags(self):
+        original_click = UploadHandler._human_click
+
+        class FakeEditor:
+            def __init__(self):
+                self.typed = []
+                self.pressed = []
+
+            def press(self, key):
+                self.pressed.append(key)
+
+            def type(self, text, delay=0):
+                self.typed.append(text)
+
+        class FakeOption:
+            @property
+            def first(self):
+                return self
+
+            def wait_for(self, **kwargs):
+                pass
+
+        class FakePage:
+            def locator(self, selector):
+                return FakeOption()
+
+        try:
+            UploadHandler._human_click = staticmethod(lambda page, locator, timeout=10_000: None)
+            editor = FakeEditor()
+            logs = []
+            UploadHandler._fill_tiktok_caption(
+                FakePage(), editor, "Tiêu đề video\n#tik #viral", log=logs.append)
+        finally:
+            UploadHandler._human_click = original_click
+        self.assertEqual(["Control+A", "Backspace"], editor.pressed[:2])
+        self.assertIn("Enter", editor.pressed)
+        self.assertEqual(["Tiêu đề video", "#tik", " ", "#viral"], editor.typed)
+        self.assertIn("TikTok: đã nhập nội dung caption", logs)
 
     def test_tiktok_upload_prefers_hidden_video_file_input(self):
         class FakeInput:

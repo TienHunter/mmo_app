@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 
 
 class Database:
@@ -56,6 +56,21 @@ class Database:
                 "counter_date": "TEXT",
                 "status": "TEXT NOT NULL DEFAULT 'idle'",
                 "hashtags": "TEXT NOT NULL DEFAULT ''",
+                "speed": "REAL NOT NULL DEFAULT 1.0",
+                "zoom_width_percent": "INTEGER NOT NULL DEFAULT 100",
+                "zoom_height_percent": "INTEGER NOT NULL DEFAULT 100",
+                "caption_mode": "TEXT NOT NULL DEFAULT 'fixed'",
+                "caption_text": "TEXT NOT NULL DEFAULT ''",
+                "output_dir": "TEXT NOT NULL DEFAULT ''",
+                "notification_sound": "TEXT NOT NULL DEFAULT ''",
+                "split_enabled": "INTEGER",
+                "overlay_enabled": "INTEGER",
+                "background_path": "TEXT NOT NULL DEFAULT ''",
+                "publish_enabled": "INTEGER",
+                "ai_api_url": "TEXT NOT NULL DEFAULT ''",
+                "ai_api_key": "TEXT NOT NULL DEFAULT ''",
+                "ai_model": "TEXT NOT NULL DEFAULT ''",
+                "ai_system_prompt": "TEXT NOT NULL DEFAULT ''",
             }
             for name, declaration in account_additions.items():
                 if name not in account_columns:
@@ -70,6 +85,10 @@ class Database:
             for name, declaration in source_additions.items():
                 if name not in source_columns:
                     connection.execute(f"ALTER TABLE channel_route_sources ADD COLUMN {name} {declaration}")
+            task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(upload_tasks)")}
+            if "is_test" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE upload_tasks ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0")
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)", (SCHEMA_VERSION,)
             )
@@ -137,6 +156,24 @@ class Database:
 
     def manual_action(self, job_id: int, message: str) -> None:
         self._finish(job_id, "manual_action", message)
+
+    def retry_job(self, job_id: int) -> None:
+        """Requeue a failed/manual-action job so the pipeline can claim it again."""
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE jobs SET status='queued', error_message=NULL, lease_owner=NULL,
+                lease_expires_at=NULL, available_at=?, updated_at=? WHERE id=?""",
+                (utc_now(), utc_now(), job_id),
+            )
+
+    def cancel_job(self, job_id: int, message: str = "Đã bỏ qua bởi người dùng") -> None:
+        """Cancel a job from the UI without deleting audit history."""
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE jobs SET status='cancelled', error_message=?, lease_owner=NULL,
+                lease_expires_at=NULL, updated_at=? WHERE id=?""",
+                (message[:4000], utc_now(), job_id),
+            )
 
     def event(self, job_id: int | None, level: str, message: str) -> None:
         with self.connect() as connection:

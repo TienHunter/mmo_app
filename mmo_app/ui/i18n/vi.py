@@ -1,0 +1,20 @@
+"""Vietnamese UI strings kept separate for future localization."""
+
+APP_NAME = "MMO App"
+NAV_DASHBOARD = "Tổng quan"
+NAV_ACCOUNTS = "Tài khoản TikTok"
+NAV_VIDEOS = "Thư viện video"
+NAV_CHANNELS = "Kênh theo dõi"
+NAV_QUEUE = "Hàng đợi & lịch đăng"
+NAV_LOGS = "Nhật ký"
+NAV_SETTINGS = "Cài đặt"
+
+START_ALL = "Bắt đầu tất cả"
+PAUSE_ALL = "Tạm dừng tất cả"
+RUNNING = "Đang hoạt động"
+PAUSED = "Đã tạm dừng"
+TUNNEL_UNKNOWN = "Kênh nhận thông báo: chưa kiểm tra"
+TASKS_IDLE = "Không có tác vụ đang chạy"
+
+EMPTY_TITLE = "Chức năng đang được chuẩn bị"
+EMPTY_BODY = "Màn hình này sẽ được hoàn thiện ở giai đoạn tiếp theo."
