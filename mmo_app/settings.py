@@ -31,13 +31,11 @@ class Settings:
     output_dir: str = field(default_factory=lambda: str(Path.home() / "Videos" / "MMOApp" / "processed"))
     channel_ids: list[str] = field(default_factory=list)
     youtube_channel_urls: list[str] = field(default_factory=list)
-    tracking_mode: str = "both"
     public_domain: str = ""
     webhook_host: str = "127.0.0.1"
     webhook_port: int = 8000
     websub_renew_interval_seconds: int = 3600
     subscription_lease_seconds: int = 864000
-    rss_interval_seconds: int = 1800
     worker_poll_seconds: int = 3
     ffmpeg_path: str = ""
     ffprobe_path: str = ""
@@ -45,6 +43,7 @@ class Settings:
     split_enabled: bool = True
     use_vpn_for_youtube: bool = False
     youtube_cookies_path: str = ""
+    download_quality: str = "best"
     output_aspect_ratio: str = "original"
     overlay_text_enabled: bool = False
     overlay_font_path: str = ""
@@ -52,6 +51,7 @@ class Settings:
     overlay_font_size: int = 56
     video_zoom_percent: int = 100
     video_speed: float = 1.0
+    video_encoder: str = "cpu"
     source_orientation_filter: str = "both"
     video_background_path: str = ""
     tiktok_publish_enabled: bool = False
@@ -64,6 +64,8 @@ class Settings:
     caption_include_title: bool = False
     caption_include_hashtags: bool = True
     hashtag_source: str = "fixed"
+    caption_mode: str = "fixed"
+    caption_text: str = ""
     ai_api_url: str = ""
     ai_api_key: str = ""
     ai_model: str = ""

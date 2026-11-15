@@ -3,11 +3,12 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import QEvent, QObject, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QComboBox, QFrame, QHBoxLayout, QLabel,
-    QMainWindow, QMessageBox, QMenu, QPushButton, QStackedWidget, QStatusBar,
-    QStyle, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QMenu, QPushButton, QSplitter, QStackedWidget,
+    QStatusBar, QStyle, QSystemTrayIcon, QTableView, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from ..application import Application
@@ -22,7 +23,7 @@ from .pages.logs_page import LogsPage
 from .pages.queue_page import QueuePage
 from .pages.settings_page import SettingsPage
 from .pages.videos_page import VideosPage
-from .theme import ThemeMode, stylesheet
+from .theme import DEFAULT_FONT_PT, ThemeMode, stylesheet
 
 
 class MainWindow(QMainWindow):
@@ -35,7 +36,9 @@ class MainWindow(QMainWindow):
         self.application = application
         self.controller = RuntimeController(application)
         self.preferences = QSettings("MMOApp", "MMOApp")
+        self._busy_cursor = False
         self._theme_mode = ThemeMode(self.preferences.value("ui/theme", ThemeMode.LIGHT.value))
+        self._font_pt = max(8.0, min(16.0, float(self.preferences.value("ui/font_pt", DEFAULT_FONT_PT))))
         self._nav: list[QToolButton] = []
         self.setWindowTitle("MMO App")
         self.setMinimumSize(QSize(1100, 680))
@@ -44,6 +47,11 @@ class MainWindow(QMainWindow):
         self._build()
         self._apply_theme()
         self._restore_activity_panel()
+        for index in range(len(self._nav)):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
+            shortcut.activated.connect(lambda index=index: self._navigate(index))
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(
+            self._refresh_current_page)
         self.pipeline_state_changed.connect(self._set_pipeline_state)
         self.controller.state_changed.connect(self.pipeline_state_changed.emit)
         self.controller.operation_failed.connect(self._show_operation_error)
@@ -79,9 +87,19 @@ class MainWindow(QMainWindow):
         self.settings_page = SettingsPage(self.application)
         self.stack.addWidget(self.settings_page)
         content_layout.addWidget(self.stack, 1)
-        layout.addWidget(content, 1)
         self.activity_panel = ActivityPanel(self.application)
-        layout.addWidget(self.activity_panel)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
+        self.splitter.addWidget(content)
+        self.splitter.addWidget(self.activity_panel)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 0)
+        self.splitter.setSizes([1100, 320])
+        self.splitter.splitterMoved.connect(self._save_splitter_sizes)
+        layout.addWidget(self.splitter, 1)
+        for subtitle in self.findChildren(QLabel, "pageSubtitle"):
+            subtitle.setWordWrap(True)
         self._build_statusbar()
         self._build_tray()
 
@@ -110,6 +128,7 @@ class MainWindow(QMainWindow):
             button.setCheckable(True)
             button.setChecked(index == 0)
             button.clicked.connect(lambda checked=False, page=index: self._navigate(page))
+            button.setToolTip(f"{label} (Ctrl+{index + 1})")
             layout.addWidget(button)
             self._nav.append(button)
         layout.addStretch()
@@ -126,10 +145,21 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(20, 10, 20, 10)
         self.page_name = QLabel(vi.NAV_DASHBOARD)
-        self.page_name.setObjectName("pageTitle")
-        self.page_name.setStyleSheet("font-size: 15pt;")
+        self.page_name.setObjectName("topbarTitle")
         layout.addWidget(self.page_name)
         layout.addStretch()
+        self.font_small_button = QToolButton()
+        self.font_small_button.setObjectName("themeButton")
+        self.font_small_button.setText("A−")
+        self.font_small_button.setToolTip("Giảm cỡ chữ hiển thị")
+        self.font_small_button.clicked.connect(lambda: self._change_font(-1))
+        layout.addWidget(self.font_small_button)
+        self.font_big_button = QToolButton()
+        self.font_big_button.setObjectName("themeButton")
+        self.font_big_button.setText("A+")
+        self.font_big_button.setToolTip("Tăng cỡ chữ hiển thị")
+        self.font_big_button.clicked.connect(lambda: self._change_font(1))
+        layout.addWidget(self.font_big_button)
         self.activity_button = QToolButton()
         self.activity_button.setObjectName("themeButton")
         self.activity_button.setText("Hoạt động")
@@ -188,15 +218,24 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(index)
         self.page_name.setText(self._nav[index].text().split("   ", 1)[-1])
 
+    def _save_splitter_sizes(self) -> None:
+        self.preferences.setValue("ui/activity_sizes", self.splitter.sizes())
+
     def _restore_activity_panel(self) -> None:
         visible = bool(self.preferences.value("ui/activity_panel", True, type=bool))
         self.activity_button.blockSignals(True)
         self.activity_button.setChecked(visible)
         self.activity_button.blockSignals(False)
         self.activity_panel.setVisible(visible)
+        sizes = self.preferences.value("ui/activity_sizes", [])
+        if isinstance(sizes, list) and len(sizes) == 2:
+            self.splitter.setSizes([int(sizes[0]), int(sizes[1])])
 
     def _toggle_activity_panel(self, visible: bool) -> None:
         self.activity_panel.setVisible(bool(visible))
+        sizes = self.preferences.value("ui/activity_sizes", [])
+        if visible and isinstance(sizes, list) and len(sizes) == 2:
+            self.splitter.setSizes([int(sizes[0]), int(sizes[1])])
         self.preferences.setValue("ui/activity_panel", bool(visible))
 
     def _toggle_theme(self) -> None:
@@ -204,8 +243,17 @@ class MainWindow(QMainWindow):
         self.preferences.setValue("ui/theme", self._theme_mode.value)
         self._apply_theme()
 
+    def _change_font(self, delta: float) -> None:
+        self._font_pt = max(8.0, min(16.0, self._font_pt + delta))
+        self.preferences.setValue("ui/font_pt", self._font_pt)
+        self._apply_theme()
+
     def _apply_theme(self) -> None:
-        QApplication.instance().setStyleSheet(stylesheet(self._theme_mode))
+        QApplication.instance().setStyleSheet(stylesheet(self._theme_mode, self._font_pt))
+        # Table row heights are pixel-based; scale them with the font.
+        row_height = int(self._font_pt * 2.6) + 4
+        for view in self.findChildren(QTableView):
+            view.verticalHeader().setDefaultSectionSize(row_height)
         self.theme_button.setText("☀" if self._theme_mode == ThemeMode.DARK else "◐")
         self.theme_button.setToolTip("Chuyển sang giao diện sáng" if self._theme_mode == ThemeMode.DARK else "Chuyển sang giao diện tối")
 
@@ -223,7 +271,18 @@ class MainWindow(QMainWindow):
 
     def _set_operation_busy(self, busy: bool) -> None:
         if busy:
+            if not self._busy_cursor:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                self._busy_cursor = True
             self.task_status.setText("Đang thực hiện yêu cầu…")
+        elif self._busy_cursor:
+            QApplication.restoreOverrideCursor()
+            self._busy_cursor = False
+
+    def _refresh_current_page(self) -> None:
+        refresh = getattr(self.stack.currentWidget(), "refresh", None)
+        if callable(refresh):
+            refresh()
 
     def _show_operation_error(self, message: str) -> None:
         QMessageBox.warning(self, "Chưa thể hoàn thành", f"{message}\n\nHãy kiểm tra cấu hình và thử lại.")

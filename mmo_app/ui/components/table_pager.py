@@ -13,11 +13,11 @@ from PySide6.QtWidgets import (
 
 
 class TablePager(QWidget):
-    """Simple client-side pager used below data tables (20 rows by default)."""
+    """Simple client-side pager used below data tables (100 rows by default)."""
 
     page_changed = Signal()
 
-    def __init__(self, page_size: int = 20, page_sizes: tuple[int, ...] = (20, 50, 100), parent=None):
+    def __init__(self, page_size: int = 100, page_sizes: tuple[int, ...] = (20, 50, 100), parent=None):
         super().__init__(parent)
         self.page_size = page_size
         self.page = 1
@@ -72,7 +72,7 @@ class TablePager(QWidget):
         self.page_changed.emit()
 
     def _change_page_size(self) -> None:
-        self.page_size = int(self.size_box.currentData() or 20)
+        self.page_size = int(self.size_box.currentData() or 100)
         self.page = 1
         self._update()
         self.page_changed.emit()

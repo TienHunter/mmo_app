@@ -27,8 +27,9 @@ class Application:
         self.websub = WebSubService(self.database, self.settings, self.youtube)
         self.pipeline = PipelineOrchestrator(self.database, self.settings)
         self.stop_event = threading.Event()
-        self.rss_thread: threading.Thread | None = None
+        self.websub_scheduler_thread: threading.Thread | None = None
         self.websub_subscribe_thread: threading.Thread | None = None
+        self._websub_thread_lock = threading.Lock()
         self.started = False
 
     def start(self) -> bool:
@@ -36,13 +37,12 @@ class Application:
         self._validate_ready_to_start()
         self.started = True
         self.stop_event.clear()
-        if self.settings.tracking_mode in {"websub", "both"}:
-            self.websub.start()
-            self._start_websub_subscribe_thread(force=True)
+        self.websub.start()
         self.pipeline.start()
-        if not self.rss_thread or not self.rss_thread.is_alive():
-            self.rss_thread = threading.Thread(target=self._rss_loop, name="rss-scheduler", daemon=True)
-            self.rss_thread.start()
+        if not self.websub_scheduler_thread or not self.websub_scheduler_thread.is_alive():
+            self.websub_scheduler_thread = threading.Thread(
+                target=self._websub_loop, name="websub-scheduler", daemon=True)
+            self.websub_scheduler_thread.start()
         return not was_running
 
     def pause(self) -> None:
@@ -50,8 +50,8 @@ class Application:
         self.stop_event.set()
         self.websub.stop()
         self.pipeline.pause()
-        if self.rss_thread:
-            self.rss_thread.join(3)
+        if self.websub_scheduler_thread:
+            self.websub_scheduler_thread.join(3)
         if self.websub_subscribe_thread:
             self.websub_subscribe_thread.join(3)
 
@@ -74,46 +74,47 @@ class Application:
         self.stop_event.set()
         self.websub.stop()
         self.pipeline.stop()
-        if self.rss_thread:
-            self.rss_thread.join(3)
+        if self.websub_scheduler_thread:
+            self.websub_scheduler_thread.join(3)
         if self.websub_subscribe_thread:
             self.websub_subscribe_thread.join(3)
 
-    def _rss_loop(self) -> None:
-        next_rss = 0.0
+    def _websub_loop(self) -> None:
         next_renew = 0.0
+        force = True
         while not self.stop_event.is_set():
-            now = time.monotonic()
-            if self.settings.tracking_mode in {"websub", "both"} and now >= next_renew:
-                self.websub.renew_due()
-                next_renew = now + max(60, self.settings.websub_renew_interval_seconds)
-            if self.settings.tracking_mode in {"rss", "both"} and self.settings.channel_ids and now >= next_rss:
-                self.youtube.poll_rss()
-                next_rss = now + max(60, self.settings.rss_interval_seconds)
+            if time.monotonic() >= next_renew:
+                try:
+                    self.websub.renew_due(force=force)
+                except Exception:
+                    logging.getLogger(__name__).exception("WebSub renew failed")
+                force = False
+                next_renew = time.monotonic() + max(60, self.settings.websub_renew_interval_seconds)
             self.stop_event.wait(5)
 
     def restart_websub(self) -> None:
         if not self.started:
             return
         self.websub.stop()
-        if self.settings.tracking_mode in {"websub", "both"}:
-            self.websub.start()
-            self._start_websub_subscribe_thread(force=True)
+        self.websub.start()
+        self._start_websub_subscribe_thread(force=True)
 
     def refresh_websub_subscriptions(self, force: bool = False) -> None:
         """Subscribe newly added/reactivated channels without restarting the app."""
-        if self.started and self.settings.tracking_mode in {"websub", "both"}:
+        if self.started:
             self._start_websub_subscribe_thread(force=force)
 
     def _start_websub_subscribe_thread(self, force: bool = False) -> None:
-        if self.websub_subscribe_thread and self.websub_subscribe_thread.is_alive():
-            return
-        self.websub_subscribe_thread = threading.Thread(
-            target=lambda: self.websub.renew_due(force=force),
-            name="websub-subscribe",
-            daemon=True,
-        )
-        self.websub_subscribe_thread.start()
+        with self._websub_thread_lock:
+            if self.websub_subscribe_thread and self.websub_subscribe_thread.is_alive():
+                return
+            thread = threading.Thread(
+                target=lambda: self.websub.renew_due(force=force),
+                name="websub-subscribe",
+                daemon=True,
+            )
+            self.websub_subscribe_thread = thread
+            thread.start()
 
     def _validate_ready_to_start(self) -> None:
         with self.database.connect() as connection:
@@ -121,8 +122,8 @@ class Application:
             has_routes = connection.execute("SELECT 1 FROM channel_routes WHERE active=1 LIMIT 1").fetchone()
         if not has_routes or not has_channels:
             raise RuntimeError("Chưa có layout/kênh YouTube. Hãy nhập cấu hình trong tab 'Luồng YouTube → TikTok', bấm lưu rồi mới bấm Bắt đầu.")
-        if self.settings.tracking_mode == "websub" and not self.settings.public_domain:
-            raise RuntimeError("Chế độ WebSub cần Public domain HTTPS. Hãy nhập domain hoặc đổi sang chế độ 'both'/'rss'.")
+        if not self.settings.public_domain:
+            raise RuntimeError("WebSub cần Public domain HTTPS. Hãy nhập domain trong Cài đặt.")
 
 
 def configure_logging(settings: Settings) -> None:

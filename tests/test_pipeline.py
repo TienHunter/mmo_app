@@ -173,12 +173,11 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual(account_id, payload["test_account_id"])
         self.assertIn("artifact_id", payload)
 
-    def test_download_uses_cookiefile_when_vpn_mode_is_enabled(self):
+    def test_download_uses_cookiefile_when_configured(self):
         captured_options = {}
         output_path = Path(self.settings.download_dir) / "UCtest" / "Downloaded [cookie00001].mp4"
         cookies_path = Path(self.temp.name) / "cookies.txt"
         cookies_path.write_text("dummy", encoding="utf-8")
-        self.settings.use_vpn_for_youtube = True
         self.settings.youtube_cookies_path = str(cookies_path)
 
         class FakeYoutubeDL:
@@ -215,6 +214,34 @@ class PipelineDatabaseTests(unittest.TestCase):
                 sys.modules["yt_dlp"] = original_module
 
         self.assertEqual(str(cookies_path), captured_options["cookiefile"])
+
+    def test_download_quality_options_map_to_formats(self):
+        self.assertIn("av01", DownloadHandler.download_format("av1_1080"))
+        self.assertIn("avc1", DownloadHandler.download_format("h264_1080"))
+        self.assertIn("height<=720", DownloadHandler.download_format("av1_720"))
+        self.assertIn("bv*+ba", DownloadHandler.download_format("unknown"))
+
+    def test_download_rejects_missing_cookie_file(self):
+        self.settings.youtube_cookies_path = str(Path(self.temp.name) / "missing.txt")
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                """INSERT INTO media_items(youtube_video_id,channel_id,title,source_url)
+                   VALUES ('cookiemiss1','UCtest','Missing','https://www.youtube.com/watch?v=cookiemiss1')"""
+            ).lastrowid
+        with self.assertRaisesRegex(RuntimeError, "Không tìm thấy file cookies YouTube"):
+            DownloadHandler(self.db, self.settings).run({"media_item_id": media_id})
+
+    def test_download_js_runtime_prefers_deno_then_node(self):
+        def which(name):
+            return "/usr/bin/deno" if name == "deno" else None
+        with mock.patch("mmo_app.services.shutil.which", side_effect=which):
+            self.assertEqual({"deno": {}}, DownloadHandler.js_runtime_options())
+        def which_node(name):
+            return "/usr/bin/node" if name == "node" else None
+        with mock.patch("mmo_app.services.shutil.which", side_effect=which_node):
+            self.assertEqual({"node": {}}, DownloadHandler.js_runtime_options())
+        with mock.patch("mmo_app.services.shutil.which", return_value=None):
+            self.assertEqual({}, DownloadHandler.js_runtime_options())
 
     def test_download_skips_video_when_orientation_filter_does_not_match(self):
         self.settings.source_orientation_filter = "portrait"
@@ -373,6 +400,19 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertTrue(channel["subscription_expires_at"])
         self.assertIn("WebSub đã subscribe thành công kênh YouTube: Verify Channel", event["message"])
 
+    def test_websub_renew_due_does_not_subscribe_same_channel_twice(self):
+        self.settings.public_domain = "https://example.com"
+        with self.db.connect() as connection:
+            connection.execute("INSERT INTO channels(channel_id,active) VALUES ('UCrenew1',1)")
+            connection.execute("INSERT INTO channels(channel_id,active) VALUES ('UCrenew2',1)")
+        websub = WebSubService(self.db, self.settings, YouTubeService(self.db, self.settings))
+        websub.youtube.sync_channels = lambda: None
+        calls = []
+        websub.subscribe = lambda channel_id: calls.append(channel_id)
+        self.assertEqual(2, websub.renew_due(force=True))
+        self.assertEqual(0, websub.renew_due(force=True))
+        self.assertEqual({"UCrenew1", "UCrenew2"}, set(calls))
+
     def test_mobile_aspect_ratio_filters_fit_without_cropping(self):
         self.assertEqual("", ProcessHandler.video_filter("original"))
         self.assertEqual(
@@ -515,6 +555,11 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual((0.0, 315.0, 1, 2), calls[0])
         self.assertAlmostEqual(315.0, calls[1][0], places=2)
         self.assertAlmostEqual(285.0, calls[1][1], places=2)
+        with self.db.connect() as connection:
+            messages = [row["message"] for row in connection.execute(
+                "SELECT message FROM job_events ORDER BY id").fetchall()]
+        self.assertTrue(any("Xử lý xong phần 1/2" in message for message in messages))
+        self.assertTrue(any("Xử lý xong phần 2/2" in message for message in messages))
 
     def test_account_split_disabled_forces_single_part(self):
         self.settings.split_enabled = True
@@ -667,6 +712,25 @@ class PipelineDatabaseTests(unittest.TestCase):
             task = connection.execute("SELECT account_id,artifact_id FROM upload_tasks").fetchone()
         self.assertEqual((account_id, artifact_id), (task["account_id"], task["artifact_id"]))
 
+    def test_route_uploads_reuses_prepared_caption_for_all_parts(self):
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                """INSERT INTO media_items(youtube_video_id,channel_id,title,source_url)
+                   VALUES ('prep0000001','UCprep','Prepared','https://www.youtube.com/watch?v=prep0000001')"""
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO tiktok_accounts(name,active) VALUES ('Prepared account',1)")
+            for index in (1, 2):
+                connection.execute(
+                    "INSERT INTO artifacts(media_item_id,kind,path,segment_index) VALUES (?,'rendered',?,?)",
+                    (media_id, f"part{index}.mp4", index))
+        ProcessHandler(self.db, self.settings)._route_uploads(
+            media_id, "Prepared", base_caption="Base", title_based=True)
+        with self.db.connect() as connection:
+            captions = [row["caption"] for row in connection.execute(
+                "SELECT caption FROM upload_tasks ORDER BY id").fetchall()]
+        self.assertEqual(["Base (1)", "Base (2)"], captions)
+
     def test_upload_caption_uses_youtube_title_index_and_hashtags(self):
         youtube = YouTubeService(self.db, self.settings)
         youtube.discover("parts000001", "UCparts", "Demo title")
@@ -721,7 +785,7 @@ class PipelineDatabaseTests(unittest.TestCase):
         try:
             ProcessHandler._generate_caption = lambda _self, title, part=1, account=None, total_parts=1: f"AI caption cho {title}"
             self.assertEqual(
-                "AI caption cho Demo title (3)",
+                "Demo title (3)\nAI caption cho Demo title",
                 handler._upload_caption("Demo title", 3, account, total_parts=3),
             )
 
@@ -772,6 +836,31 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertIsNone(channel)
         self.assertIsNone(source)
 
+    def test_queue_lists_processed_video_without_upload_task(self):
+        with self.db.connect() as connection:
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name,active) VALUES ('Queue account',0)").lastrowid
+            route_id = connection.execute(
+                "INSERT INTO channel_routes(name,account_id) VALUES ('Queue route',?)",
+                (account_id,)).lastrowid
+            connection.execute("INSERT INTO channels(channel_id) VALUES ('UCqueue')")
+            connection.execute(
+                "INSERT INTO channel_route_sources(route_id,channel_id,source_url) VALUES (?,?,?)",
+                (route_id, "UCqueue", "https://youtube.com/@queue"))
+            media_id = connection.execute(
+                """INSERT INTO media_items(youtube_video_id,channel_id,title,source_url,status)
+                   VALUES ('queue000001','UCqueue','Queue video',
+                           'https://www.youtube.com/watch?v=queue000001','processed')"""
+            ).lastrowid
+            connection.execute(
+                """INSERT INTO artifacts(media_item_id,kind,path,segment_index)
+                   VALUES (?,'rendered','queue_1.mp4',1)""", (media_id,))
+        rows = UIRepository(self.db).list_upload_tasks()
+        self.assertEqual(1, len(rows))
+        self.assertEqual("no_task", rows[0]["status"])
+        self.assertEqual("Queue account", rows[0]["account_name"])
+        self.assertTrue(rows[0]["created_at"])
+
     def test_pipeline_runs_downloads_in_parallel(self):
         self.settings.max_download_workers = 2
         self.settings.max_process_workers = 1
@@ -821,6 +910,14 @@ class PipelineDatabaseTests(unittest.TestCase):
         with self.db.connect() as connection:
             connection.execute(
                 "INSERT INTO channels(channel_id,title) VALUES ('UClog','Kênh Log')")
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name) VALUES ('TikTok Log')").lastrowid
+            route_id = connection.execute(
+                "INSERT INTO channel_routes(name,account_id) VALUES ('Log route',?)",
+                (account_id,)).lastrowid
+            connection.execute(
+                "INSERT INTO channel_route_sources(route_id,channel_id,source_url) VALUES (?,?,?)",
+                (route_id, "UClog", "https://youtube.com/@log"))
             media_id = connection.execute(
                 """INSERT INTO media_items(youtube_video_id,channel_id,title,source_url)
                    VALUES ('logvideo001','UClog','Video Log','https://www.youtube.com/watch?v=logvideo001')"""
@@ -849,11 +946,28 @@ class PipelineDatabaseTests(unittest.TestCase):
                     (job_id,))
             ]
         self.assertTrue(any("Bắt đầu tải video: Video Log" in m for m in messages))
+        self.assertTrue(any("Tài khoản TikTok: TikTok Log" in m for m in messages))
         self.assertTrue(any("Kênh: Kênh Log" in m for m in messages))
         self.assertTrue(any(
             "Link: https://www.youtube.com/watch?v=logvideo001" in m
             for m in messages))
         self.assertTrue(any("Hoàn tất tải video: Video Log" in m for m in messages))
+
+    def test_job_log_prefers_test_tiktok_account(self):
+        with self.db.connect() as connection:
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name) VALUES ('TikTok Test Log')").lastrowid
+            media_id = connection.execute(
+                """INSERT INTO media_items(youtube_video_id,channel_id,title)
+                   VALUES ('testlog0001','test_account_9','Test Log')"""
+            ).lastrowid
+        self.db.enqueue(
+            "download", media_id, "test:log",
+            json.dumps({"test_account_id": account_id, "is_test": 1}))
+        job = self.db.claim("test", ("download",))
+        details = PipelineOrchestrator(self.db, self.settings)._job_details(job)
+        self.assertIn("Tài khoản TikTok: TikTok Test Log", details)
+        self.assertIn("Kênh: Test video", details)
 
     def test_pipeline_activity_estimates_remaining_time(self):
         def stamp(seconds_ago: int) -> str:
@@ -1144,7 +1258,7 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertFalse(options.split_enabled)
         self.assertTrue(options.overlay_enabled)
 
-    def test_account_ai_config_overrides_global_and_blank_inherits(self):
+    def test_global_ai_config_wins_and_account_is_fallback(self):
         self.settings.ai_api_url = "https://global.example/v1/chat"
         self.settings.ai_api_key = "global-key"
         self.settings.ai_model = "global-model"
@@ -1156,9 +1270,63 @@ class PipelineDatabaseTests(unittest.TestCase):
             account = connection.execute(
                 "SELECT * FROM tiktok_accounts WHERE id=?", (account_id,)).fetchone()
         handler = ProcessHandler(self.db, self.settings)
-        self.assertEqual("https://account.example/v1/chat", handler._ai_value(account, "ai_api_url"))
+        self.assertEqual("https://global.example/v1/chat", handler._ai_value(account, "ai_api_url"))
         self.assertEqual("global-key", handler._ai_value(account, "ai_api_key"))
+        self.assertEqual("global-model", handler._ai_value(account, "ai_model"))
+        self.settings.ai_model = ""
         self.assertEqual("account-model", handler._ai_value(account, "ai_model"))
+
+    def test_account_without_caption_source_uses_global_caption(self):
+        self.settings.caption_mode = "fixed"
+        self.settings.caption_text = "Global caption"
+        with self.db.connect() as connection:
+            account_id = connection.execute(
+                "INSERT INTO tiktok_accounts(name,caption_mode,caption_text) VALUES ('Inherit','','')"
+            ).lastrowid
+            account = connection.execute(
+                "SELECT * FROM tiktok_accounts WHERE id=?", (account_id,)).fetchone()
+        caption, used_ai, title_based = ProcessHandler(
+            self.db, self.settings)._base_upload_caption("Demo title", account)
+        self.assertEqual("Global caption", caption)
+        self.assertFalse(used_ai)
+        self.assertFalse(title_based)
+
+    def test_process_logs_ai_caption_below_video_title(self):
+        source = Path(self.temp.name) / "source.mp4"
+        source.write_bytes(b"video")
+        youtube = YouTubeService(self.db, self.settings)
+        youtube.discover("aicaption01", "UCai", "Demo title")
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "SELECT id FROM media_items WHERE youtube_video_id='aicaption01'").fetchone()["id"]
+            artifact_id = connection.execute(
+                "INSERT INTO artifacts(media_item_id,kind,path) VALUES (?,'downloaded',?)",
+                (media_id, str(source))).lastrowid
+            connection.execute(
+                "INSERT INTO tiktok_accounts(name,active) VALUES ('AI account',1)")
+            job = {"id": 1, "media_item_id": media_id,
+                   "payload": json.dumps({"artifact_id": artifact_id})}
+        originals = (ProcessHandler._duration, ProcessHandler._render,
+                     ProcessHandler._route_uploads, ProcessHandler._base_upload_caption)
+        try:
+            ProcessHandler._duration = lambda _handler, _source: 60.0
+            def fake_render(handler, _source, destination, start, length, title="", part=1, total_parts=1, options=None):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"rendered")
+            ProcessHandler._render = fake_render
+            ProcessHandler._route_uploads = lambda *_args, **_kwargs: None
+            ProcessHandler._base_upload_caption = lambda _self, _title, _account: (
+                "AI caption\n#tag", True, False)
+            ProcessHandler(self.db, self.settings).run(job)
+        finally:
+            (ProcessHandler._duration, ProcessHandler._render,
+             ProcessHandler._route_uploads, ProcessHandler._base_upload_caption) = originals
+        with self.db.connect() as connection:
+            messages = [row["message"] for row in connection.execute(
+                "SELECT message FROM job_events ORDER BY id").fetchall()]
+        self.assertTrue(any(
+            "AI đã sinh caption/hashtag cho video: Demo title\nAI caption\n#tag" == message
+            for message in messages))
 
     def test_zoom_out_and_speed_are_applied_to_ffmpeg_command(self):
         source = Path(self.temp.name) / "source.mp4"
@@ -1186,6 +1354,103 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertIn("setpts=PTS/1.25", command_text)
         self.assertIn("atempo=1.25", command_text)
         self.assertEqual(1, command.count("-vf"))
+
+    def test_gpu_encoder_selection_changes_ffmpeg_codec(self):
+        source = Path(self.temp.name) / "source.mp4"
+        destination = Path(self.temp.name) / "gpu.mp4"
+        source.write_bytes(b"source")
+        self.settings.video_encoder = "cuda_cq27_max"
+        calls = []
+        original = services.subprocess.run
+        try:
+            services.subprocess.run = lambda command, **kwargs: calls.append(command)
+            ProcessHandler(self.db, self.settings)._render(
+                source,
+                destination,
+                0,
+                30,
+                "Title",
+                1,
+                1,
+                services.ProcessingOptions(60, "9:16", 100, 1.0, ""),
+            )
+        finally:
+            services.subprocess.run = original
+        command = calls[0]
+        self.assertIn("h264_nvenc", command)
+        self.assertIn("-cq", command)
+        self.assertIn("27", command)
+        self.assertIn("-maxrate", command)
+        self.assertIn("2.5M", command)
+        self.assertNotIn("libx264", command)
+
+    def test_cuda_encoder_builds_full_gpu_filter_pipeline(self):
+        source = Path(self.temp.name) / "source.mp4"
+        destination = Path(self.temp.name) / "cuda.mp4"
+        source.write_bytes(b"source")
+        self.settings.video_encoder = "cuda"
+        calls = []
+        original = services.subprocess.run
+        try:
+            services.subprocess.run = lambda command, **kwargs: calls.append(command)
+            ProcessHandler(self.db, self.settings)._render(
+                source,
+                destination,
+                0,
+                30,
+                "Title",
+                1,
+                1,
+                services.ProcessingOptions(60, "9:16", 120, 1.0, ""),
+            )
+        finally:
+            services.subprocess.run = original
+        command = calls[0]
+        text = " ".join(command)
+        self.assertIn("-hwaccel cuda", text)
+        self.assertIn("scale_cuda=1296:2304", text)
+        self.assertIn("hwdownload", text)
+        self.assertIn("hwupload_cuda", text)
+        self.assertIn("h264_nvenc", text)
+        self.assertNotIn("libx264", text)
+
+    def test_cuda_independent_zoom_uses_single_scale_cuda(self):
+        filter_text = ProcessHandler.cuda_video_filter("9:16", 100, 140)
+        self.assertEqual(1, filter_text.count("scale_cuda="))
+        self.assertIn("hwdownload", filter_text)
+        self.assertIn("scale=trunc(iw*1/2)*2:trunc(ih*1.4/2)*2", filter_text)
+        self.assertIn("hwupload_cuda", filter_text)
+
+    def test_cuda_failure_falls_back_to_cpu_render(self):
+        source = Path(self.temp.name) / "source.mp4"
+        destination = Path(self.temp.name) / "fallback.mp4"
+        source.write_bytes(b"source")
+        self.settings.video_encoder = "cuda"
+        calls = []
+        original = services.subprocess.run
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                raise services.subprocess.CalledProcessError(1, command)
+
+        try:
+            services.subprocess.run = fake_run
+            ProcessHandler(self.db, self.settings)._render(
+                source,
+                destination,
+                0,
+                30,
+                "Title",
+                1,
+                1,
+                services.ProcessingOptions(60, "9:16", 120, 1.0, ""),
+            )
+        finally:
+            services.subprocess.run = original
+        self.assertEqual(2, len(calls))
+        self.assertIn("h264_nvenc", " ".join(calls[0]))
+        self.assertIn("libx264", calls[1])
 
     def test_trim_duration_is_applied_to_source_before_speed_filter(self):
         source = Path(self.temp.name) / "source.mp4"
@@ -1221,7 +1486,6 @@ class PipelineDatabaseTests(unittest.TestCase):
 
     def test_application_start_forces_websub_resubscribe(self):
         self.settings.public_domain = "https://example.com"
-        self.settings.tracking_mode = "websub"
         app = Application(self.settings)
         with app.database.connect() as connection:
             connection.execute("INSERT INTO channels(channel_id,active,subscription_status) VALUES ('UCforce',1,'subscribed')")
@@ -1266,7 +1530,6 @@ class PipelineDatabaseTests(unittest.TestCase):
 
     def test_application_does_not_spawn_duplicate_websub_subscribe_threads(self):
         self.settings.public_domain = "https://example.com"
-        self.settings.tracking_mode = "websub"
         app = Application(self.settings)
         with app.database.connect() as connection:
             connection.execute("INSERT INTO channels(channel_id,active,subscription_status) VALUES ('UCforce',1,'subscribed')")

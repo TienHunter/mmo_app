@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -24,6 +25,8 @@ class WebSubService:
         self.db, self.settings, self.youtube = database, settings, youtube
         self.server: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
+        self._renew_lock = threading.Lock()
+        self._last_attempt: dict[str, tuple[float, str]] = {}
 
     @property
     def callback_url(self) -> str:
@@ -110,6 +113,10 @@ class WebSubService:
             self.thread.join(3); self.thread = None
 
     def renew_due(self, force: bool = False) -> int:
+        with self._renew_lock:
+            return self._renew_due_locked(force)
+
+    def _renew_due_locked(self, force: bool) -> int:
         if not self.settings.public_domain:
             LOGGER.warning("WebSub chưa subscribe: PUBLIC_DOMAIN đang trống")
             self._event("warning", "WebSub chưa subscribe: Public domain HTTPS đang trống")
@@ -126,17 +133,24 @@ class WebSubService:
                     (threshold,),
                 ).fetchall()
         succeeded = 0
+        callback_url = self.callback_url
         for channel in rows:
+            channel_id = channel["channel_id"]
+            last_attempt = self._last_attempt.get(channel_id)
+            if last_attempt and time.monotonic() - last_attempt[0] < 300 and last_attempt[1] == callback_url:
+                LOGGER.info("WebSub bỏ qua renew trùng channel=%s", channel_id)
+                continue
             try:
-                channel_label = self._channel_label(channel["channel_id"])
-                LOGGER.info("WebSub subscribing channel=%s callback=%s", channel["channel_id"], self.callback_url)
+                channel_label = self._channel_label(channel_id)
+                LOGGER.info("WebSub subscribing channel=%s callback=%s", channel_id, callback_url)
                 self._event("info", f"WebSub gửi yêu cầu subscribe kênh YouTube: {channel_label}")
-                self.subscribe(channel["channel_id"]); succeeded += 1
+                self.subscribe(channel_id); succeeded += 1
+                self._last_attempt[channel_id] = (time.monotonic(), callback_url)
             except Exception as exc:
-                LOGGER.exception("WebSub subscribe %s failed", channel["channel_id"])
+                LOGGER.exception("WebSub subscribe %s failed", channel_id)
                 with self.db.connect() as connection:
                     connection.execute("UPDATE channels SET subscription_status='error',subscription_error=? WHERE id=?", (str(exc)[:1000], channel["id"]))
-                self._event("error", f"WebSub subscribe lỗi kênh YouTube {self._channel_label(channel['channel_id'])}: {str(exc)[:500]}")
+                self._event("error", f"WebSub subscribe lỗi kênh YouTube {self._channel_label(channel_id)}: {str(exc)[:500]}")
         if rows:
             LOGGER.info("WebSub subscribe requests sent: %s/%s", succeeded, len(rows))
         return succeeded

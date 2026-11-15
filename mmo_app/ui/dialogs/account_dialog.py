@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -27,6 +26,7 @@ class AccountDialog(QDialog):
     def __init__(self, account: dict | None = None, defaults: dict | None = None, parent=None):
         super().__init__(parent)
         defaults = defaults or {}
+        self._account = account or {}
         self.setWindowTitle("Sửa tài khoản TikTok" if account else "Thêm tài khoản TikTok")
         self.setMinimumSize(620, 680)
         layout = QVBoxLayout(self)
@@ -74,6 +74,19 @@ class AccountDialog(QDialog):
         self.hashtags = QLineEdit()
         self.hashtags.setPlaceholderText("#review #viral")
         account_form.addRow("Hashtag caption", self.hashtags)
+
+        self.caption_mode = QComboBox()
+        self.caption_mode.addItem("Theo Cài đặt chung", "")
+        self.caption_mode.addItem("Caption cố định", "fixed")
+        self.caption_mode.addItem("Sinh caption bằng AI", "ai")
+        account_form.addRow("Nguồn caption", self.caption_mode)
+        caption_hint = QLabel(
+            "Caption cố định và cấu hình AI dùng chung trong Cài đặt. "
+            "Chọn \"Theo Cài đặt chung\" để dùng nguồn caption mặc định."
+        )
+        caption_hint.setWordWrap(True)
+        caption_hint.setObjectName("muted")
+        account_form.addRow("", caption_hint)
 
         self.daily_limit = QSpinBox()
         self.daily_limit.setRange(0, 999)
@@ -128,39 +141,6 @@ class AccountDialog(QDialog):
         self.publish_enabled.setChecked(bool(defaults.get("publish_enabled", False)))
         posting_form.addRow("", self.publish_enabled)
 
-        self.caption_mode = QComboBox()
-        self.caption_mode.addItem("Caption cố định", "fixed")
-        self.caption_mode.addItem("Sinh caption bằng AI", "ai")
-        self.caption_mode.currentIndexChanged.connect(self._sync_caption_fields)
-        posting_form.addRow("Nguồn caption", self.caption_mode)
-
-        self.caption_text = QPlainTextEdit()
-        self.caption_text.setPlaceholderText(
-            "Caption cố định, có thể nhiều dòng và kèm hashtag.")
-        self.caption_text.setFixedHeight(72)
-        posting_form.addRow("Caption cố định", self.caption_text)
-
-        self.ai_api_url = QLineEdit()
-        self.ai_api_url.setPlaceholderText(
-            str(defaults.get("ai_api_url") or "https://api.openai.com/v1/chat/completions"))
-        posting_form.addRow("AI API URL", self.ai_api_url)
-
-        self.ai_api_key = QLineEdit()
-        self.ai_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ai_api_key.setPlaceholderText("Để trống để dùng key trong Cài đặt chung")
-        posting_form.addRow("AI API Key", self.ai_api_key)
-
-        self.ai_model = QLineEdit()
-        self.ai_model.setPlaceholderText(str(defaults.get("ai_model") or "gpt-4o-mini"))
-        posting_form.addRow("AI Model", self.ai_model)
-
-        self.ai_system_prompt = QPlainTextEdit()
-        self.ai_system_prompt.setPlaceholderText(
-            str(defaults.get("ai_system_prompt")
-                or "Bạn là trợ lý viết caption TikTok. Trả về caption hoàn chỉnh, có thể kèm hashtag."))
-        self.ai_system_prompt.setFixedHeight(80)
-        posting_form.addRow("AI System prompt", self.ai_system_prompt)
-
         storage_form = section("Lưu trữ & thông báo")
         self.output_dir = QLineEdit()
         self.output_dir.setPlaceholderText(
@@ -202,15 +182,9 @@ class AccountDialog(QDialog):
                 bool(publish_enabled) if publish_enabled is not None
                 else bool(defaults.get("publish_enabled", False)))
             self.caption_mode.setCurrentIndex(
-                max(0, self.caption_mode.findData(account.get("caption_mode") or "fixed")))
-            self.caption_text.setPlainText(account.get("caption_text") or "")
-            self.ai_api_url.setText(account.get("ai_api_url") or "")
-            self.ai_api_key.setText(account.get("ai_api_key") or "")
-            self.ai_model.setText(account.get("ai_model") or "")
-            self.ai_system_prompt.setPlainText(account.get("ai_system_prompt") or "")
+                max(0, self.caption_mode.findData(account.get("caption_mode") or "")))
             self.output_dir.setText(account.get("output_dir") or "")
             self.notification_sound.setText(account.get("notification_sound") or "")
-        self._sync_caption_fields()
 
     def _path_row(self, edit: QLineEdit, kind: str) -> QWidget:
         row = QWidget()
@@ -235,12 +209,6 @@ class AccountDialog(QDialog):
             path = QFileDialog.getExistingDirectory(self, "Chọn thư mục", edit.text())
         if path:
             edit.setText(path)
-
-    def _sync_caption_fields(self) -> None:
-        is_fixed = self.caption_mode.currentData() == "fixed"
-        self.caption_text.setEnabled(is_fixed)
-        for widget in (self.ai_api_url, self.ai_api_key, self.ai_model, self.ai_system_prompt):
-            widget.setEnabled(not is_fixed)
 
     def _validate_and_accept(self) -> None:
         name = self.name.text().strip()
@@ -267,12 +235,12 @@ class AccountDialog(QDialog):
             "overlay_enabled": self.overlay_enabled.isChecked(),
             "background_path": self.background_path.text().strip(),
             "publish_enabled": self.publish_enabled.isChecked(),
-            "caption_mode": self.caption_mode.currentData(),
-            "caption_text": self.caption_text.toPlainText().strip(),
-            "ai_api_url": self.ai_api_url.text().strip(),
-            "ai_api_key": self.ai_api_key.text().strip(),
-            "ai_model": self.ai_model.text().strip(),
-            "ai_system_prompt": self.ai_system_prompt.toPlainText().strip(),
+            "caption_mode": self.caption_mode.currentData() or "",
+            "caption_text": str(self._account.get("caption_text") or ""),
+            "ai_api_url": str(self._account.get("ai_api_url") or ""),
+            "ai_api_key": str(self._account.get("ai_api_key") or ""),
+            "ai_model": str(self._account.get("ai_model") or ""),
+            "ai_system_prompt": str(self._account.get("ai_system_prompt") or ""),
             "output_dir": self.output_dir.text().strip(),
             "notification_sound": self.notification_sound.text().strip(),
         }

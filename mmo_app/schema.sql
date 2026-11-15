@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS channel_route_sources(
 CREATE TABLE IF NOT EXISTS upload_tasks(
  id INTEGER PRIMARY KEY, media_item_id INTEGER NOT NULL, artifact_id INTEGER NOT NULL, account_id INTEGER,
  caption TEXT NOT NULL DEFAULT '', scheduled_at TEXT, status TEXT NOT NULL DEFAULT 'pending', posted_at TEXT,
- error_message TEXT, is_test INTEGER NOT NULL DEFAULT 0, UNIQUE(artifact_id,account_id),
+ error_message TEXT, is_test INTEGER NOT NULL DEFAULT 0, created_at TEXT,
+ UNIQUE(artifact_id,account_id),
  FOREIGN KEY(media_item_id) REFERENCES media_items(id), FOREIGN KEY(artifact_id) REFERENCES artifacts(id),
  FOREIGN KEY(account_id) REFERENCES tiktok_accounts(id));
