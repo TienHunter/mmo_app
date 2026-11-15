@@ -81,7 +81,7 @@ class AccountsPage(QWidget):
         subtitle.setObjectName("pageSubtitle")
         words.addWidget(title)
         words.addWidget(subtitle)
-        header_layout.addLayout(words)
+        header_layout.addLayout(words, 1)
         header_layout.addStretch()
         add = QPushButton("Thêm tài khoản")
         add.setObjectName("primaryButton")
@@ -147,10 +147,16 @@ class AccountsPage(QWidget):
         detail.setObjectName("muted")
         layout.addWidget(detail)
 
+        mode = account.get("caption_mode") or ""
+        if mode:
+            caption_label = "AI" if mode == "ai" else "cố định"
+        else:
+            global_mode = self.application.settings.caption_mode
+            caption_label = f"theo chung ({'AI' if global_mode == 'ai' else 'cố định'})"
         processing = QLabel(
             f"Tốc độ {float(account.get('speed') or 1.0):g}x  ·  "
             f"Zoom {account.get('zoom_width_percent', 100)}×{account.get('zoom_height_percent', 100)}%  ·  "
-            f"Caption {'AI' if (account.get('caption_mode') or 'fixed') == 'ai' else 'cố định'}  ·  "
+            f"Caption {caption_label}  ·  "
             f"Output: {account.get('output_dir') or 'thư mục chung'}"
         )
         processing.setObjectName("muted")
@@ -178,6 +184,10 @@ class AccountsPage(QWidget):
         edit = QPushButton("Sửa")
         edit.clicked.connect(lambda _=False, a=account: self._edit_account(a))
         controls.addWidget(edit)
+        clone = QPushButton("Nhân bản")
+        clone.setToolTip("Tạo tài khoản mới từ toàn bộ cấu hình tài khoản này.")
+        clone.clicked.connect(lambda _=False, a=account: self._clone_account(a))
+        controls.addWidget(clone)
         toggle = QPushButton("Tạm dừng" if active else "Bật lại")
         toggle.clicked.connect(lambda _=False, a=account: self._toggle_account(a))
         controls.addWidget(toggle)
@@ -194,11 +204,6 @@ class AccountsPage(QWidget):
             "overlay_enabled": bool(settings.overlay_text_enabled),
             "background_path": settings.video_background_path,
             "publish_enabled": bool(settings.tiktok_publish_enabled),
-            "caption_mode": "ai" if (settings.hashtag_source or "fixed") == "ai" else "fixed",
-            "ai_api_url": settings.ai_api_url,
-            "ai_api_key": settings.ai_api_key,
-            "ai_model": settings.ai_model,
-            "ai_system_prompt": settings.ai_system_prompt,
             "output_dir": settings.output_dir,
         }
 
@@ -207,7 +212,12 @@ class AccountsPage(QWidget):
         if dialog.exec() != AccountDialog.Accepted:
             return
         values = dialog.values()
-        self.repository.add_account(
+        self._create_account(values)
+        self.refresh()
+        show_toast(self, f"Đã thêm tài khoản {values['name']}.", "success")
+
+    def _create_account(self, values: dict) -> int:
+        return self.repository.add_account(
             values["name"],
             values["mode"],
             values["endpoint"],
@@ -230,8 +240,23 @@ class AccountsPage(QWidget):
             values["ai_model"],
             values["ai_system_prompt"],
         )
+
+    def _clone_account(self, account: dict) -> None:
+        copied = dict(account)
+        copied["name"] = f"{account.get('name') or 'TikTok'} (bản sao)"
+        copied["gpm_profile_id"] = ""
+        dialog = AccountDialog(copied, self._account_defaults(), self)
+        if dialog.exec() != AccountDialog.Accepted:
+            return
+        values = dialog.values()
+        new_id = self._create_account(values)
+        self.repository.set_account_active(new_id, False)
         self.refresh()
-        show_toast(self, f"Đã thêm tài khoản {values['name']}.", "success")
+        show_toast(
+            self,
+            f"Đã nhân bản thành {values['name']}. Nhập GPM Profile ID và bật lại khi sẵn sàng.",
+            "success",
+        )
 
     def _edit_account(self, account: dict) -> None:
         dialog = AccountDialog(account, self._account_defaults(), self)

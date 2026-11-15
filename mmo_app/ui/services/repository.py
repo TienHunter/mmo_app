@@ -567,18 +567,39 @@ class UIRepository:
         return [dict(row) for row in rows]
 
     def list_upload_tasks(self, account_id: int | None = None, limit: int = 500) -> list[dict[str, Any]]:
-        where = "WHERE u.account_id = ?" if account_id else ""
-        params: list[Any] = [account_id] if account_id else []
-        query = f"""SELECT u.id, u.status, u.caption, u.scheduled_at, u.posted_at,
-                          u.error_message, u.is_test, a.path, a.segment_index,
+        """Queue view: upload tasks plus rendered videos that never got a task."""
+        task_filter = "WHERE u.account_id = ?" if account_id else ""
+        orphan_filter = "AND rt.id = ?" if account_id else ""
+        task_params: list[Any] = [account_id] if account_id else []
+        orphan_params: list[Any] = [account_id] if account_id else []
+        query = f"""SELECT u.id AS id, u.status, u.caption, u.scheduled_at,
+                          u.posted_at, u.error_message, u.is_test, a.path,
+                          a.segment_index,
+                          COALESCE(u.created_at, m.updated_at) AS created_at,
                           m.title AS video_title, t.name AS account_name
                    FROM upload_tasks u
                    JOIN artifacts a ON a.id = u.artifact_id
                    JOIN media_items m ON m.id = u.media_item_id
                    JOIN tiktok_accounts t ON t.id = u.account_id
-                   {where}
-                   ORDER BY u.id DESC LIMIT ?"""
-        params.append(limit)
+                   {task_filter}
+                   UNION ALL
+                   SELECT NULL AS id, 'no_task' AS status, '' AS caption,
+                          NULL AS scheduled_at, NULL AS posted_at,
+                          NULL AS error_message, 0 AS is_test, a.path,
+                          a.segment_index, m.updated_at AS created_at,
+                          m.title AS video_title, rt.name AS account_name
+                   FROM artifacts a
+                   JOIN media_items m ON m.id = a.media_item_id
+                   LEFT JOIN channel_route_sources s ON s.channel_id = m.channel_id
+                   LEFT JOIN channel_routes r ON r.id = s.route_id AND r.active = 1
+                   LEFT JOIN tiktok_accounts rt ON rt.id = r.account_id
+                   WHERE a.kind = 'rendered'
+                     AND NOT EXISTS (SELECT 1 FROM upload_tasks u2
+                                     WHERE u2.artifact_id = a.id)
+                     {orphan_filter}
+                   ORDER BY created_at DESC, video_title
+                   LIMIT ?"""
+        params = [*task_params, *orphan_params, limit]
         with self.database.connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]

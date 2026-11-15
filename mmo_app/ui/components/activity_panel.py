@@ -19,12 +19,12 @@ from ..services.repository import UIRepository, format_local_time
 
 
 _STAGE_STYLES = {
-    "running": ("●", "#2563EB", "Đang chạy"),
-    "waiting": ("●", "#D97706", "Đang chờ"),
-    "success": ("✓", "#16A34A", "Hoàn tất"),
-    "failed": ("✕", "#DC2626", "Lỗi"),
-    "warning": ("!", "#D97706", "Cần xử lý"),
-    "idle": ("○", "#64748B", "Trống"),
+    "running": ("●", "Đang chạy"),
+    "waiting": ("●", "Đang chờ"),
+    "success": ("✓", "Hoàn tất"),
+    "failed": ("✕", "Lỗi"),
+    "warning": ("!", "Cần xử lý"),
+    "idle": ("○", "Trống"),
 }
 
 _LEVEL_COLORS = {
@@ -52,8 +52,8 @@ class _StageRow(QFrame):
         top = QHBoxLayout()
         top.setSpacing(8)
         self.dot = QLabel("○")
+        self.dot.setObjectName("stageDot")
         self.dot.setFixedWidth(18)
-        self.dot.setStyleSheet("font-size: 14pt; color: #64748B;")
         self.title = QLabel(label)
         self.title.setStyleSheet("font-weight: 700;")
         self.state = QLabel("Trống")
@@ -85,10 +85,12 @@ class _StageRow(QFrame):
     def set_state(self, state: str, detail: str,
                   eta_seconds: int | None = None,
                   tasks: list[dict] | None = None) -> None:
-        symbol, color, label = _STAGE_STYLES.get(state, _STAGE_STYLES["idle"])
+        symbol, label = _STAGE_STYLES.get(state, _STAGE_STYLES["idle"])
         self.dot.setText(symbol)
-        self.dot.setStyleSheet(f"font-size: 14pt; color: {color};")
-        self.state.setStyleSheet(f"color: {color}; font-weight: 600;")
+        for widget in (self.dot, self.state):
+            widget.setProperty("stageState", state)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
         self._clear_details()
         if state == "running" and tasks:
             self.state.setText(
@@ -126,7 +128,7 @@ class ActivityPanel(QFrame):
         self.application = application
         self.repository = UIRepository(application.database)
         self.setObjectName("card")
-        self.setFixedWidth(320)
+        self.setMinimumWidth(240)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(8)
@@ -203,11 +205,13 @@ class ActivityPanel(QFrame):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        for event in events:
+        for index, event in enumerate(events):
             card = QFrame()
             card.setObjectName("eventCard")
+            tint = ("rgba(148,163,184,0.20)" if index % 2 == 0
+                    else "rgba(148,163,184,0.08)")
             card.setStyleSheet(
-                "QFrame#eventCard { background: rgba(148,163,184,0.16);"
+                f"QFrame#eventCard {{ background: {tint};"
                 " border-radius: 8px; }")
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(10, 8, 10, 8)
@@ -215,9 +219,8 @@ class ActivityPanel(QFrame):
             clock_text = format_local_time(
                 event["created_at"], include_date=False)
             clock = QLabel(clock_text)
+            clock.setObjectName("eventClock")
             clock.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            clock.setStyleSheet(
-                "font-weight: 700; font-size: 9pt; color: #2563EB;")
             message = QLabel(event["message"])
             message.setWordWrap(True)
             message.setTextInteractionFlags(

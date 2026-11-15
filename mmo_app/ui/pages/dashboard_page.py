@@ -105,7 +105,7 @@ class DashboardPage(QWidget):
         subtitle.setObjectName("pageSubtitle")
         words.addWidget(title)
         words.addWidget(subtitle)
-        header_layout.addLayout(words)
+        header_layout.addLayout(words, 1)
         header_layout.addStretch()
         pause = QPushButton("Tạm dừng tất cả")
         pause.clicked.connect(self._pause_all)
@@ -203,13 +203,9 @@ class DashboardPage(QWidget):
     def _render_tunnel(self) -> None:
         domain = (self.application.settings.public_domain or "").strip()
         if not domain:
-            self.tunnel.setText("Kênh nhận thông báo: chưa cấu hình (đang dùng RSS dự phòng)")
+            self.tunnel.setText("Kênh nhận thông báo: chưa cấu hình domain WebSub")
             return
-        mode = self.application.settings.tracking_mode
-        if mode == "rss":
-            self.tunnel.setText("Kênh nhận thông báo: đang dùng RSS")
-        else:
-            self.tunnel.setText(f"Kênh nhận thông báo: {domain}")
+        self.tunnel.setText(f"Kênh nhận thông báo: {domain}")
 
     def _render_attention(self, items: list[dict]) -> None:
         while self.attention_box.count():
@@ -268,6 +264,10 @@ class DashboardPage(QWidget):
         for event in events:
             stamp = format_local_time(event.get("created_at"), include_date=False)
             rows.append([stamp, event.get("message") or ""])
+        signature = tuple(map(tuple, rows))
+        if signature == getattr(self, "_events_signature", None):
+            return
+        self._events_signature = signature
         self.activity_table.set_rows(rows)
 
     def _open_kpi(self, key: str) -> None:

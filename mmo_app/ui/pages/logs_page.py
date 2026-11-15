@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 
-from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QComboBox,
@@ -37,9 +36,6 @@ class LogsPage(QWidget):
         self.repository = UIRepository(application.database)
         self._build()
         self.refresh()
-        timer = QTimer(self)
-        timer.timeout.connect(self.refresh)
-        timer.start(3000)
 
     def _build(self) -> None:
         layout = QVBoxLayout(self)
@@ -53,12 +49,15 @@ class LogsPage(QWidget):
         words = QVBoxLayout()
         title = QLabel("Nhật ký")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("Lịch sử hoạt động của hệ thống, cập nhật tự động.")
+        subtitle = QLabel("Lịch sử hoạt động của hệ thống; bấm Làm mới để cập nhật.")
         subtitle.setObjectName("pageSubtitle")
         words.addWidget(title)
         words.addWidget(subtitle)
-        header_layout.addLayout(words)
+        header_layout.addLayout(words, 1)
         header_layout.addStretch()
+        refresh = QPushButton("Làm mới")
+        refresh.clicked.connect(lambda: self.refresh(reset_page=False))
+        header_layout.addWidget(refresh)
         export = QPushButton("Xuất ra file")
         export.clicked.connect(self._export)
         header_layout.addWidget(export)
@@ -68,7 +67,7 @@ class LogsPage(QWidget):
         filters.setSpacing(10)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Tìm trong nội dung nhật ký…")
-        self.search.returnPressed.connect(self.refresh)
+        self.search.returnPressed.connect(lambda: self.refresh(reset_page=True))
         filters.addWidget(self.search, 2)
 
         self.level = QComboBox()
@@ -76,7 +75,8 @@ class LogsPage(QWidget):
         self.level.addItem("Thông tin", "INFO")
         self.level.addItem("Cảnh báo", "WARNING")
         self.level.addItem("Lỗi", "ERROR")
-        self.level.currentIndexChanged.connect(self.refresh)
+        self.level.currentIndexChanged.connect(
+            lambda: self.refresh(reset_page=True))
         filters.addWidget(self.level, 1)
         layout.addLayout(filters)
 
@@ -85,25 +85,35 @@ class LogsPage(QWidget):
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(False)
-        for index, width in enumerate((160, 90, 700)):
+        header.setStretchLastSection(True)
+        for index, width in enumerate((160, 90, 410)):
             self.table.setColumnWidth(index, width)
         layout.addWidget(self.table, 1)
         self.pager = TablePager()
         self.pager.page_changed.connect(self._render_page)
         layout.addWidget(self.pager)
+        self._rows_signature = None
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
-        self.refresh()
+        self.refresh(reset_page=False)
+        # Row heights measured while the table was hidden can be wrong; remeasure now.
+        self.table.resizeRowsToContents()
 
-    def refresh(self) -> None:
+    def refresh(self, reset_page: bool = True) -> None:
         self._all_rows = self.repository.list_events(
             level=self.level.currentData() or None,
             search=self.search.text().strip() or None,
         )
-        self.pager.reset()
+        signature = tuple(
+            (event["id"], event["level"], event["created_at"], event["message"])
+            for event in self._all_rows)
+        if reset_page:
+            self.pager.reset()
         self.pager.set_total(len(self._all_rows))
+        if not reset_page and signature == self._rows_signature:
+            return
+        self._rows_signature = signature
         self._render_page()
 
     def _render_page(self) -> None:
@@ -117,7 +127,10 @@ class LogsPage(QWidget):
             level_item.setForeground(LEVEL_COLORS.get(level, QColor("#64748B")))
             self.table.setItem(row, 0, time_item)
             self.table.setItem(row, 1, level_item)
-            self.table.setItem(row, 2, QTableWidgetItem(event["message"] or ""))
+            message = event["message"] or ""
+            self.table.setItem(row, 2, QTableWidgetItem(message))
+        # Fit multi-line messages and any app font size change.
+        self.table.resizeRowsToContents()
 
     def _export(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Xuất nhật ký", "mmo_app_logs.csv", "CSV (*.csv)")

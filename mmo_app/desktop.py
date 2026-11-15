@@ -98,11 +98,9 @@ class Desktop(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         self._bind_mousewheel(canvas, form)
         self.variables = {
-            "tracking_mode": tk.StringVar(value=settings.tracking_mode),
             "public_domain": tk.StringVar(value=settings.public_domain),
             "webhook_host": tk.StringVar(value=settings.webhook_host),
             "webhook_port": tk.StringVar(value=str(settings.webhook_port)),
-            "rss_interval_seconds": tk.StringVar(value=str(settings.rss_interval_seconds)),
             "download_dir": tk.StringVar(value=settings.download_dir),
             "output_dir": tk.StringVar(value=settings.output_dir),
             "use_vpn_for_youtube": tk.BooleanVar(value=settings.use_vpn_for_youtube),
@@ -124,7 +122,6 @@ class Desktop(tk.Tk):
             ("Public domain HTTPS (Cloudflare Tunnel)", "public_domain"),
             ("WebSub bind host", "webhook_host"),
             ("WebSub port", "webhook_port"),
-            ("RSS fallback interval (giây)", "rss_interval_seconds"),
             ("Thư mục tải video", "download_dir"), ("Thư mục video đã xử lý", "output_dir"),
             ("Speed toàn app", "video_speed"),
             ("GPM API URL", "gpm_api_url"),
@@ -133,13 +130,11 @@ class Desktop(tk.Tk):
             ("Màu chữ (white hoặc #RRGGBB)", "overlay_font_color"),
             ("Cỡ chữ", "overlay_font_size"),
         ]
-        ttk.Label(form, text="Chế độ theo dõi").grid(row=0, column=0, sticky="w", padx=4, pady=7)
-        ttk.Combobox(form, textvariable=self.variables["tracking_mode"], values=("both", "websub", "rss"), state="readonly", width=18).grid(row=0, column=1, sticky="w", padx=4, pady=7)
-        for offset, (label, key) in enumerate(fields, start=1):
+        for offset, (label, key) in enumerate(fields):
             row = offset
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=7)
             ttk.Entry(form, textvariable=self.variables[key], width=85).grid(row=row, column=1, sticky="ew", padx=4, pady=7)
-        zoom_row = len(fields) + 1
+        zoom_row = len(fields)
         ttk.Label(form, text="Zoom video toàn app").grid(row=zoom_row, column=0, sticky="w", padx=4, pady=7)
         zoom_frame = ttk.Frame(form)
         zoom_frame.grid(row=zoom_row, column=1, sticky="ew", padx=4, pady=7)
@@ -194,13 +189,11 @@ class Desktop(tk.Tk):
             resolved = self._save_routes()
             value.youtube_channel_urls = [item[2] for item in resolved]
             value.channel_ids = [item[0] for item in resolved]
-            value.tracking_mode = self.variables["tracking_mode"].get()
             value.public_domain = self.variables["public_domain"].get().strip().rstrip("/")
             value.webhook_host = self.variables["webhook_host"].get().strip() or "127.0.0.1"
             value.webhook_port = int(self.variables["webhook_port"].get())
             if not 1 <= value.webhook_port <= 65535: raise ValueError("WebSub port phải từ 1 đến 65535")
-            value.rss_interval_seconds = max(60, int(self.variables["rss_interval_seconds"].get()))
-            if value.tracking_mode in {"websub", "both"} and value.public_domain and not value.public_domain.startswith("https://"):
+            if value.public_domain and not value.public_domain.startswith("https://"):
                 raise ValueError("Public domain WebSub phải bắt đầu bằng https://")
             value.download_dir = self.variables["download_dir"].get().strip()
             value.output_dir = self.variables["output_dir"].get().strip()
@@ -555,12 +548,9 @@ class Desktop(tk.Tk):
         self.pause_button.configure(state="normal" if running else "disabled")
         self.summary.configure(text="  |  ".join(f"{row['status']}: {row['count']}" for row in totals) or "Chưa có tác vụ")
         subscription_text = "  |  ".join(f"{row['subscription_status']}: {row['count']}" for row in subscriptions)
-        if self.application.settings.tracking_mode in {"websub", "both"}:
-            self.websub_status.configure(
-                text=f"WebSub: {subscription_text or 'chưa có kênh'} — chỉ video mới đăng sau khi subscribe sẽ vào hàng đợi"
-            )
-        else:
-            self.websub_status.configure(text="WebSub: không sử dụng (đang chạy chế độ RSS)")
+        self.websub_status.configure(
+            text=f"WebSub: {subscription_text or 'chưa có kênh'} — chỉ video mới đăng sau khi subscribe sẽ vào hàng đợi"
+        )
         self.jobs.delete(*self.jobs.get_children())
         for row in rows:
             self.jobs.insert("", "end", values=(row["id"], row["title"], row["media_item_id"], row["kind"], row["status"], row["attempts"], row["error_message"] or ""))

@@ -44,7 +44,7 @@ class ChannelsPage(QWidget):
         subtitle.setObjectName("pageSubtitle")
         words.addWidget(title)
         words.addWidget(subtitle)
-        header_layout.addLayout(words)
+        header_layout.addLayout(words, 1)
         header_layout.addStretch()
         refresh = QPushButton("Làm mới")
         refresh.clicked.connect(self.refresh)

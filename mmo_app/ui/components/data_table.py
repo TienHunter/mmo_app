@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from .row_hover import install_row_hover
+from .copyable_table import _ReadOnlyTextDelegate
 
 
 class DataTable(QTableView):
@@ -22,7 +23,13 @@ class DataTable(QTableView):
         self.setModel(self._model)
         self.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.setEditTriggers(
+            QAbstractItemView.SelectedClicked
+            | QAbstractItemView.DoubleClicked
+            | QAbstractItemView.EditKeyPressed)
+        self.setItemDelegate(_ReadOnlyTextDelegate(self))
+        self.setToolTip(
+            "Kéo chuột trong ô để bôi đen chữ rồi Ctrl+C sao chép phần bôi đen (Esc để thoát). Không bôi đen thì Ctrl+C sao chép ô/vùng chọn.")
         self.setAlternatingRowColors(True)
         self.setShowGrid(True)
         self.setSortingEnabled(True)
@@ -52,6 +59,10 @@ class DataTable(QTableView):
         copy_action.triggered.connect(self.copy_selection)
         copy_action.setEnabled(bool(self.selectionModel().selectedIndexes()))
         menu.addAction(copy_action)
+        select_action = QAction("Bôi đen chữ trong ô", menu)
+        select_action.setEnabled(index.isValid())
+        select_action.triggered.connect(lambda: self.edit(index))
+        menu.addAction(select_action)
         menu.exec(self.viewport().mapToGlobal(position))
 
     def selected_text(self) -> str:

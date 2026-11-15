@@ -16,7 +16,7 @@ else:
         (str(root.parent / "video_processor" / "dist_release" / "VideoProcessor" / "_internal" / "tools" / "ffmpeg" / "bin" / "ffprobe.exe"), "tools/ffmpeg/bin"),
         (str(root.parent / "youtube_tracker" / "dist_responsive" / "YouTubeTracker" / "_internal" / "runtime" / "node.exe"), "tools/runtime"),
     ]
-for package in ("yt_dlp", "playwright"):
+for package in ("yt_dlp", "yt_dlp_ejs", "playwright"):
     package_datas, package_binaries, package_hidden = collect_all(package)
     datas += package_datas; binaries += package_binaries; hiddenimports += package_hidden
 

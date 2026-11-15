@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class Database:
@@ -89,6 +89,8 @@ class Database:
             if "is_test" not in task_columns:
                 connection.execute(
                     "ALTER TABLE upload_tasks ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0")
+            if "created_at" not in task_columns:
+                connection.execute("ALTER TABLE upload_tasks ADD COLUMN created_at TEXT")
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)", (SCHEMA_VERSION,)
             )

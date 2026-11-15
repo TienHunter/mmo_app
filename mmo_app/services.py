@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -11,7 +12,6 @@ import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 import urllib.parse
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,6 +27,24 @@ YOUTUBE_CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{20,30}$")
 # Split-length thresholds applied to the already speed-adjusted duration.
 SPLIT_THRESHOLDS_SECONDS = (300.0, 480.0, 900.0, 1080.0)
 MAX_VIDEO_PARTS = 5
+
+# codec + args; CRF/CQ 18 giữ chất lượng gần tương đương x264.
+VIDEO_ENCODER_ARGS = {
+    "cpu": ("libx264", ["-preset", "veryfast", "-crf", "18"]),
+    "cuda": ("h264_nvenc", ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "23", "-b:v", "0"]),
+    "cuda_cq27": ("h264_nvenc", ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "27", "-b:v", "0"]),
+    "cuda_cq27_max": ("h264_nvenc", ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "27", "-b:v", "0", "-maxrate", "2.5M", "-bufsize", "5M"]),
+    "intel": ("h264_qsv", ["-preset", "veryfast", "-global_quality", "18"]),
+    "amd": ("h264_amf", ["-quality", "speed", "-rc", "cqp", "-qp_i", "18", "-qp_p", "18"]),
+}
+AUTO_ENCODER_ORDER = ("cuda", "intel", "amd")
+
+DOWNLOAD_FORMATS = {
+    "best": "bv*+ba/b[ext=mp4]/b",
+    "av1_1080": "bv*[height<=1080][vcodec^=av01]+ba[acodec^=mp4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
+    "h264_1080": "bv*[height<=1080][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
+    "av1_720": "bv*[height<=720][vcodec^=av01]+ba[acodec^=mp4a]/bv*[height<=720]+ba/b[height<=720]/b",
+}
 
 ROUTE_ACCOUNT_SQL = """
 SELECT a.*, s.background_path AS route_background_path
@@ -350,38 +368,6 @@ class YouTubeService:
                 connection.execute(
                     f"UPDATE channels SET active=(channel_id IN ({marks}))", values)
 
-    def poll_rss(self) -> int:
-        self.sync_channels()
-        with self.db.connect() as connection:
-            channels = connection.execute(
-                "SELECT * FROM channels WHERE active=1").fetchall()
-        found = 0
-        namespaces = {"atom": "http://www.w3.org/2005/Atom",
-                      "yt": "http://www.youtube.com/xml/schemas/2015"}
-        for channel in channels:
-            url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel['channel_id']}"
-            try:
-                with urllib.request.urlopen(url, timeout=30) as response:
-                    root = ET.fromstring(response.read())
-                for entry in root.findall("atom:entry", namespaces):
-                    video_id = entry.findtext(
-                        "yt:videoId", namespaces=namespaces)
-                    if not video_id or not YOUTUBE_ID.match(video_id):
-                        continue
-                    title = entry.findtext(
-                        "atom:title", default="", namespaces=namespaces)
-                    published = entry.findtext(
-                        "atom:published", default="", namespaces=namespaces)
-                    if self.discover(video_id, channel["channel_id"], title, published):
-                        found += 1
-                with self.db.connect() as connection:
-                    connection.execute(
-                        "UPDATE channels SET last_checked_at=? WHERE id=?", (utc_now(), channel["id"]))
-            except Exception as exc:
-                LOGGER.exception("RSS channel %s failed: %s",
-                                 channel["channel_id"], exc)
-        return found
-
     def discover(self, video_id: str, channel_id: str, title: str, published_at: str = "") -> bool:
         with self.db.connect() as connection:
             existing = connection.execute(
@@ -402,6 +388,19 @@ class YouTubeService:
 class DownloadHandler:
     def __init__(self, database: Database, settings: Settings):
         self.db, self.settings = database, settings
+
+    @staticmethod
+    def download_format(value: str) -> str:
+        return DOWNLOAD_FORMATS.get(
+            str(value or "best").strip().lower(), DOWNLOAD_FORMATS["best"])
+
+    @staticmethod
+    def js_runtime_options() -> dict[str, dict]:
+        """yt-dlp 2026+ needs an explicit JS runtime for YouTube n challenges."""
+        for name in ("deno", "node", "bun"):
+            if shutil.which(name):
+                return {name: {}}
+        return {}
 
     def run(self, job) -> None:
         with self.db.connect() as connection:
@@ -428,18 +427,21 @@ class DownloadHandler:
             raise RuntimeError("Thiếu dependency yt-dlp") from exc
         options = {
             "outtmpl": str(target / "%(title).180B [%(id)s].%(ext)s"),
-            "format": "bv*+ba/b[ext=mp4]/b",
+            "format": self.download_format(self.settings.download_quality),
             "merge_output_format": "mp4",
             "noplaylist": True,
             "quiet": True,
         }
-        if bool(getattr(self.settings, "use_vpn_for_youtube", False)):
-            cookies_path = str(getattr(self.settings, "youtube_cookies_path", "") or "").strip()
-            if not cookies_path:
-                raise RuntimeError("Đã bật VPN nhưng chưa cấu hình cookies YouTube")
+        cookies_path = str(getattr(self.settings, "youtube_cookies_path", "") or "").strip()
+        if cookies_path:
             if not Path(cookies_path).is_file():
                 raise RuntimeError(f"Không tìm thấy file cookies YouTube: {cookies_path}")
             options["cookiefile"] = cookies_path
+        elif bool(getattr(self.settings, "use_vpn_for_youtube", False)):
+            raise RuntimeError("Đã bật VPN nhưng chưa cấu hình cookies YouTube")
+        js_runtimes = self.js_runtime_options()
+        if js_runtimes:
+            options["js_runtimes"] = js_runtimes
         ffmpeg_binary = self.settings.media_binary("ffmpeg")
         if ffmpeg_binary and (ffmpeg_binary != "ffmpeg" or Path(ffmpeg_binary).exists()):
             options["ffmpeg_location"] = ffmpeg_binary
@@ -680,6 +682,7 @@ class ProcessHandler:
 
     def __init__(self, database: Database, settings: Settings):
         self.db, self.settings = database, settings
+        self._encoder_cache: str | None = None
 
     def run(self, job) -> None:
         payload = json.loads(job["payload"])
@@ -715,6 +718,19 @@ class ProcessHandler:
             "INFO",
             f"Process: duration gốc={duration:.1f}s, speed={options.speed:.3g}x, duration sau speed={effective_duration:.1f}s, parts={total_parts}, output={output}",
         )
+        prepared_caption: str | None = None
+        prepared_title_based = False
+        caption_account = self._resolve_upload_account(media["id"], test_account_id)
+        # Caption/AI is generated even for paused accounts; paused only blocks upload tasks.
+        if caption_account:
+            prepared_caption, used_ai, prepared_title_based = self._base_upload_caption(
+                media["title"] or "", caption_account)
+            if used_ai:
+                self.db.event(
+                    job["id"],
+                    "INFO",
+                    f"AI đã sinh caption/hashtag cho video: {media['title']}\n{prepared_caption}",
+                )
         for index, (output_start, output_length) in enumerate(segment_ranges, start=1):
             destination = self.output_path(
                 output, media["title"] or "", index)
@@ -728,6 +744,16 @@ class ProcessHandler:
                 total_parts,
                 options,
             )
+            LOGGER.info(
+                "Process part %s/%s done: %s", index, total_parts, destination)
+            account_label = (
+                f" | Tài khoản TikTok: {caption_account['name']}"
+                if caption_account else "")
+            self.db.event(
+                job["id"],
+                "INFO",
+                f"Xử lý xong phần {index}/{total_parts}: {destination.name} — sẵn sàng đăng TikTok{account_label} ({destination})",
+            )
             segments.append((index, destination))
         with self.db.connect() as connection:
             for index, path in segments:
@@ -739,7 +765,8 @@ class ProcessHandler:
                 "UPDATE media_items SET status='processed',updated_at=? WHERE id=?", (utc_now(), media["id"]))
         self._route_uploads(
             media["id"], media["title"] or "",
-            account_id=test_account_id, is_test=is_test)
+            account_id=test_account_id, is_test=is_test,
+            base_caption=prepared_caption, title_based=prepared_title_based)
 
     def _processing_options(self, channel_id: str | None,
                             account_id: int | None = None) -> ProcessingOptions:
@@ -899,6 +926,48 @@ class ProcessHandler:
             return None
         return None
 
+    def _probe_video_encoder(self, name: str) -> bool:
+        codec, codec_args = VIDEO_ENCODER_ARGS[name]
+        if name.startswith("cuda"):
+            cuda_filter = (
+                "format=nv12,hwupload_cuda,"
+                "scale_cuda=256:256:force_original_aspect_ratio=decrease,"
+                "pad_cuda=256:256:0:0:black"
+            )
+            command = [
+                self.settings.media_binary("ffmpeg"), "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=256x256:r=1", "-frames:v", "1",
+                "-vf", cuda_filter, "-an", "-c:v", codec, *codec_args, "-f", "null", "-",
+            ]
+        else:
+            command = [
+                self.settings.media_binary("ffmpeg"), "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=256x256:r=1", "-frames:v", "1",
+                "-an", "-c:v", codec, *codec_args, "-f", "null", "-",
+            ]
+        try:
+            result = subprocess.run(
+                command, capture_output=True, timeout=20, **_hidden_subprocess_kwargs())
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _video_encoder_args(self) -> tuple[str, str, list[str]]:
+        choice = str(getattr(self.settings, "video_encoder", "cpu") or "cpu").strip().lower()
+        if choice == "nvidia":
+            choice = "cuda"
+        if choice == "auto":
+            if self._encoder_cache is None:
+                self._encoder_cache = next(
+                    (name for name in AUTO_ENCODER_ORDER if self._probe_video_encoder(name)),
+                    "cpu",
+                )
+            choice = self._encoder_cache
+        if choice not in VIDEO_ENCODER_ARGS:
+            choice = "cpu"
+        codec, codec_args = VIDEO_ENCODER_ARGS[choice]
+        return choice, codec, list(codec_args)
+
     def _render(self, source: Path, destination: Path, start: float, length: float | None,
                 title: str = "", part: int = 1, total_parts: int = 1,
                 options: ProcessingOptions | None = None) -> None:
@@ -910,6 +979,7 @@ class ProcessHandler:
             str(getattr(self.settings, "video_background_path", "") or ""),
         )
         zoom_width, zoom_height = options.zoom_pair()
+        encoder_name, codec, codec_args = self._video_encoder_args()
         overlay_enabled = (
             bool(self.settings.overlay_text_enabled)
             if options.overlay_enabled is None else bool(options.overlay_enabled)
@@ -932,13 +1002,16 @@ class ProcessHandler:
         temporary_files: list[Path] = []
         caption_image: Path | None = None
         caption_x = caption_y = 0
+        overlay_fallback = False
         if overlay_enabled:
             caption_text = self.caption_overlay_text(title, part, total_parts)
             try:
                 caption_image, caption_x, caption_y = self.caption_overlay_image(
-                    destination, caption_text, options.aspect_ratio, video_box)
+                    destination, caption_text, options.aspect_ratio, video_box,
+                    opaque=encoder_name.startswith("cuda"))
                 temporary_files.append(caption_image)
             except Exception as exc:
+                overlay_fallback = True
                 LOGGER.exception("Cannot render caption overlay image: %s", exc)
                 overlay_filters, text_files = self.overlay_filters(
                     destination, title, part, total_parts, video_box)
@@ -977,11 +1050,63 @@ class ProcessHandler:
             command += ["-vf", ",".join(video_filters)]
         if speed_changed:
             command += ["-af", self.audio_speed_filter(options.speed)]
-        command += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(destination)]
+        cuda_command: list[str] | None = None
+        if encoder_name.startswith("cuda") and not use_background and not overlay_fallback and base_video_filter:
+            cuda_filter = self.cuda_video_filter(
+                options.aspect_ratio, zoom_width, zoom_height)
+            if cuda_filter:
+                cuda_command = [
+                    self.settings.media_binary("ffmpeg"), "-y",
+                    "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+                    "-ss", str(start),
+                ]
+                if length is not None:
+                    cuda_command += ["-t", str(length)]
+                cuda_command += ["-i", str(source)]
+                if caption_image:
+                    cuda_command += ["-loop", "1", "-i", str(caption_image)]
+                speed_prefix = (
+                    f"setpts=PTS/{options.speed:.6g}," if speed_changed else "")
+                if caption_image:
+                    graph = (
+                        f"[1:v]format=nv12,hwupload_cuda[cap];"
+                        f"[0:v]{speed_prefix}{cuda_filter}[base];"
+                        f"[base][cap]overlay_cuda={caption_x}:{caption_y}[v]"
+                    )
+                else:
+                    graph = f"[0:v]{speed_prefix}{cuda_filter}[v]"
+                cuda_command += ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
+                if speed_changed:
+                    cuda_command += ["-af", self.audio_speed_filter(options.speed)]
+                if length is not None:
+                    cuda_command += ["-t", str(max(0.1, float(length) / options.speed))]
+                elif caption_image:
+                    cuda_command += ["-shortest"]
+                cuda_command += ["-c:v", codec, *codec_args, "-c:a", "aac",
+                                 "-movflags", "+faststart", str(destination)]
+        output_args = ["-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(destination)]
         try:
-            subprocess.run(command, capture_output=True, check=True,
-                           timeout=7200, **_hidden_subprocess_kwargs())
+            if cuda_command is not None:
+                try:
+                    subprocess.run(cuda_command, capture_output=True, check=True,
+                                   timeout=7200, **_hidden_subprocess_kwargs())
+                    return
+                except subprocess.CalledProcessError:
+                    LOGGER.exception("Pipeline CUDA lỗi, chuyển sang CPU (libx264)")
+                    encoder_name = "cpu"
+                    codec, codec_args = VIDEO_ENCODER_ARGS["cpu"]
+            encode_command = command + ["-c:v", codec, *codec_args] + output_args
+            try:
+                subprocess.run(encode_command, capture_output=True, check=True,
+                               timeout=7200, **_hidden_subprocess_kwargs())
+            except subprocess.CalledProcessError:
+                if encoder_name == "cpu":
+                    raise
+                LOGGER.exception("Bộ mã hóa %s lỗi, chuyển sang CPU (libx264)", encoder_name)
+                cpu_codec, cpu_args = VIDEO_ENCODER_ARGS["cpu"]
+                subprocess.run(command + ["-c:v", cpu_codec, *cpu_args] + output_args,
+                               capture_output=True, check=True,
+                               timeout=7200, **_hidden_subprocess_kwargs())
         finally:
             for path in temporary_files:
                 path.unlink(missing_ok=True)
@@ -1085,8 +1210,9 @@ class ProcessHandler:
         return lines or [" "]
 
     def caption_overlay_image(self, destination: Path, text: str, aspect_ratio: str,
-                              video_box: VideoBox | None = None) -> tuple[Path, int, int]:
-        """Render the white rounded caption plate as a transparent PNG."""
+                              video_box: VideoBox | None = None,
+                              opaque: bool = False) -> tuple[Path, int, int]:
+        """Render the white rounded caption plate as a PNG; opaque for CUDA overlay."""
         from PIL import Image, ImageDraw, ImageFont
 
         canvas_width, canvas_height = (
@@ -1113,6 +1239,10 @@ class ProcessHandler:
             fill=(0, 0, 0, 255), spacing=10, align="center",
         )
         path = destination.with_name(destination.stem + ".caption.png")
+        if opaque:
+            flat = Image.new("RGB", image.size, (255, 255, 255))
+            flat.paste(image, mask=image.getchannel("A"))
+            image = flat
         image.save(path)
         x = max(0, (canvas_width - width) // 2)
         # Keep the caption below TikTok's top navigation ("For You" header).
@@ -1181,6 +1311,44 @@ class ProcessHandler:
             f"scale={zoom_width_expr}:{zoom_height_expr},"
             f"crop=min(iw\\,{width}):min(ih\\,{height}):(iw-ow)/2:(ih-oh)/2,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+        )
+
+    @classmethod
+    def cuda_video_filter(cls, aspect_ratio: str, zoom_percent: int = 100,
+                          zoom_height_percent: int | None = None) -> str:
+        """GPU filter chain; crop/pad fall back to CPU only when zoom needs cropping."""
+        size = cls.ASPECT_SIZES.get(aspect_ratio)
+        if not size:
+            return ""
+        width, height = size
+        zoom_width = max(
+            0, min(300, int(zoom_percent if zoom_percent is not None else 100))) / 100
+        zoom_height = max(0, min(300, int(
+            zoom_height_percent if zoom_height_percent is not None else zoom_percent))) / 100
+        if abs(zoom_width - zoom_height) < 0.0001:
+            target_width = max(2, int(width * zoom_width) // 2 * 2)
+            target_height = max(2, int(height * zoom_height) // 2 * 2)
+            if zoom_width <= 1.0:
+                return (
+                    f"scale_cuda={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                    f"pad_cuda={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+                )
+            return (
+                f"scale_cuda={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                f"hwdownload,format=nv12,"
+                f"crop=min(iw\\,{width}):min(ih\\,{height}):(iw-ow)/2:(ih-oh)/2,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,hwupload_cuda"
+            )
+        zoom_width_expr = (
+            "2" if zoom_width == 0 else f"trunc(iw*{zoom_width:.6g}/2)*2")
+        zoom_height_expr = (
+            "2" if zoom_height == 0 else f"trunc(ih*{zoom_height:.6g}/2)*2")
+        return (
+            f"scale_cuda={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"hwdownload,format=nv12,"
+            f"scale={zoom_width_expr}:{zoom_height_expr},"
+            f"crop=min(iw\\,{width}):min(ih\\,{height}):(iw-ow)/2:(ih-oh)/2,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,hwupload_cuda"
         )
 
     @classmethod
@@ -1274,13 +1442,8 @@ class ProcessHandler:
         parts.append(speed)
         return ",".join(f"atempo={part:.6g}" for part in parts)
 
-    def _route_uploads(self, media_id: int, caption: str,
-                       account_id: int | None = None, is_test: bool = False) -> None:
-        queued: list[tuple[int, int]] = []
-        test_message = ""
+    def _resolve_upload_account(self, media_id: int, account_id: int | None = None):
         with self.db.connect() as connection:
-            media = connection.execute(
-                "SELECT channel_id FROM media_items WHERE id=?", (media_id,)).fetchone()
             if account_id:
                 account = connection.execute(
                     "SELECT * FROM tiktok_accounts WHERE id=?",
@@ -1288,20 +1451,34 @@ class ProcessHandler:
                 ).fetchone()
                 if not account:
                     raise RuntimeError("Tài khoản TikTok của video test không tồn tại")
-            else:
+                return account
+            media = connection.execute(
+                "SELECT channel_id FROM media_items WHERE id=?", (media_id,)).fetchone()
+            if not media:
+                return None
+            account = connection.execute(
+                """SELECT a.* FROM channel_route_sources s
+                JOIN channel_routes r ON r.id=s.route_id AND r.active=1
+                JOIN tiktok_accounts a ON a.id=r.account_id
+                WHERE s.channel_id=? ORDER BY r.id LIMIT 1""",
+                (media["channel_id"],),
+            ).fetchone()
+            if not account:
                 account = connection.execute(
-                    """SELECT a.* FROM channel_route_sources s
-                    JOIN channel_routes r ON r.id=s.route_id AND r.active=1
-                    JOIN tiktok_accounts a ON a.id=r.account_id
-                    WHERE s.channel_id=? ORDER BY r.id LIMIT 1""",
-                    (media["channel_id"],),
-                ).fetchone() if media else None
-                if account and not bool(account["active"]):
-                    # Account is paused: still process locally, but never post.
-                    return
-                if not account:
-                    account = connection.execute(
-                        "SELECT * FROM tiktok_accounts WHERE active=1 ORDER BY id LIMIT 1").fetchone()
+                    "SELECT * FROM tiktok_accounts WHERE active=1 ORDER BY id LIMIT 1").fetchone()
+            return account
+
+    def _route_uploads(self, media_id: int, caption: str,
+                       account_id: int | None = None, is_test: bool = False,
+                       base_caption: str | None = None,
+                       title_based: bool = False) -> None:
+        queued: list[tuple[int, int]] = []
+        test_message = ""
+        account = self._resolve_upload_account(media_id, account_id)
+        if account and not account_id and not bool(account["active"]):
+            # Account is paused: still process locally, but never post.
+            return
+        with self.db.connect() as connection:
             artifacts = connection.execute(
                 """SELECT * FROM artifacts WHERE media_item_id=? AND kind='rendered'
                 ORDER BY COALESCE(segment_index,1), id""",
@@ -1310,14 +1487,16 @@ class ProcessHandler:
             if not account:
                 return
             total_parts = len(artifacts)
+            if base_caption is None:
+                base_caption, _, title_based = self._base_upload_caption(caption, account)
             for artifact in artifacts:
                 part = int(artifact["segment_index"] or 1)
-                upload_caption = self._upload_caption(
-                    caption, part, account, total_parts)
+                upload_caption = self._caption_for_part(
+                    base_caption or "", part, total_parts, title_based)
                 connection.execute(
                     """INSERT INTO upload_tasks(
-                         media_item_id,artifact_id,account_id,caption,status,is_test)
-                       VALUES (?,?,?,?,?,?)
+                         media_item_id,artifact_id,account_id,caption,status,is_test,created_at)
+                       VALUES (?,?,?,?,?,?,?)
                        ON CONFLICT(artifact_id,account_id) DO UPDATE SET
                          caption=excluded.caption,
                          is_test=excluded.is_test,
@@ -1326,7 +1505,8 @@ class ProcessHandler:
                            WHEN upload_tasks.status='test_ready' THEN 'pending'
                            ELSE upload_tasks.status END""",
                     (media_id, artifact["id"], account["id"], upload_caption,
-                     "test_ready" if is_test else "pending", 1 if is_test else 0),
+                     "test_ready" if is_test else "pending", 1 if is_test else 0,
+                     utc_now()),
                 )
                 task = connection.execute(
                     "SELECT id FROM upload_tasks WHERE artifact_id=? AND account_id=?",
@@ -1345,16 +1525,30 @@ class ProcessHandler:
                 "upload", item_id, f"upload:{task_id}", json.dumps({"task_id": task_id}))
 
     def _upload_caption(self, title: str, part: int, account,
-                        total_parts: int = 1) -> str:
+                        total_parts: int = 1,
+                        base_caption: str | None = None) -> str:
         """Compose the TikTok description from the account caption settings."""
-        caption_text = str(account["caption_text"] or "").strip()
-        caption_mode = str(account["caption_mode"] or "fixed").lower()
+        title_based = False
+        if base_caption is None:
+            base_caption, _, title_based = self._base_upload_caption(title, account)
+        return self._caption_for_part(base_caption, part, total_parts, title_based)
+
+    def _base_upload_caption(self, title: str, account) -> tuple[str, bool, bool]:
+        """Generate the caption/hashtags once, before video parts are rendered."""
+        caption_text = (
+            str(getattr(self.settings, "caption_text", "") or "").strip()
+            or str(account["caption_text"] or "").strip()
+        )
+        caption_mode = (
+            str(account["caption_mode"] or "").strip().lower()
+            or str(getattr(self.settings, "caption_mode", "fixed") or "fixed").strip().lower()
+        )
         if caption_mode == "ai":
             try:
-                generated = self._generate_caption(
-                    title, part, account, total_parts)
+                generated = self._generate_caption(title, 1, account, 1)
                 if generated:
-                    return self._with_part_suffix(generated, part, total_parts)
+                    lines = [(title or "").strip(), generated.strip()]
+                    return "\n".join(line for line in lines if line), True, True
             except Exception as exc:
                 LOGGER.exception("AI caption generation failed")
                 self.db.event(
@@ -1363,15 +1557,23 @@ class ProcessHandler:
                     f"Generate caption bằng AI thất bại, dùng caption cố định: {exc}",
                 )
         if caption_text:
-            return self._with_part_suffix(caption_text, part, total_parts)
+            return caption_text, False, False
         title_line = (title or "").strip()
-        if title_line and total_parts > 1:
-            title_line = f"{title_line} ({part})"
         lines = [title_line]
         hashtags = self.normalize_hashtag_caption(str(account["hashtags"] or ""))
         if hashtags:
             lines.append(hashtags)
-        return "\n".join(line for line in lines if line).strip()
+        return "\n".join(line for line in lines if line).strip(), False, True
+
+    @classmethod
+    def _caption_for_part(cls, caption: str, part: int, total_parts: int,
+                          title_based: bool = False) -> str:
+        if title_based:
+            lines = caption.splitlines()
+            if lines and total_parts > 1 and part > 0:
+                lines[0] = f"{lines[0]} ({part})"
+            return "\n".join(lines)
+        return cls._with_part_suffix(caption, part, total_parts)
 
     @staticmethod
     def _with_part_suffix(caption: str, part: int, total_parts: int = 1) -> str:
@@ -1381,11 +1583,14 @@ class ProcessHandler:
         return caption
 
     def _ai_value(self, account, key: str, fallback: str = "") -> str:
+        value = str(getattr(self.settings, key, "") or "").strip()
+        if value:
+            return value
         if account is not None and key in account.keys():
-            value = str(account[key] or "").strip()
-            if value:
-                return value
-        return str(getattr(self.settings, key, "") or "").strip() or fallback
+            account_value = str(account[key] or "").strip()
+            if account_value:
+                return account_value
+        return fallback
 
     def _generate_caption(self, title: str, part: int = 1, account=None,
                           total_parts: int = 1) -> str:
@@ -2583,6 +2788,10 @@ class PipelineOrchestrator:
         account = ""
         download_link = ""
         try:
+            payload = json.loads(job["payload"] or "{}")
+        except Exception:
+            payload = {}
+        try:
             with self.db.connect() as connection:
                 media = connection.execute(
                     """SELECT m.title,m.youtube_video_id,m.channel_id,m.source_url,
@@ -2603,10 +2812,6 @@ class PipelineOrchestrator:
                     else:
                         channel = media["channel_id"] or "không rõ kênh"
                 if kind == "upload":
-                    try:
-                        payload = json.loads(job["payload"] or "{}")
-                    except Exception:
-                        payload = {}
                     task = connection.execute(
                         """SELECT a.name FROM upload_tasks u
                            JOIN tiktok_accounts a ON a.id=u.account_id
@@ -2615,15 +2820,28 @@ class PipelineOrchestrator:
                     ).fetchone()
                     if task:
                         account = task["name"] or ""
+                elif media:
+                    test_account_id = payload.get("test_account_id")
+                    row = (
+                        connection.execute(
+                            "SELECT name FROM tiktok_accounts WHERE id=?",
+                            (int(test_account_id),),
+                        ).fetchone()
+                        if test_account_id else None
+                    )
+                    if not row:
+                        row = channel_account(connection, media["channel_id"])
+                    if row:
+                        account = row["name"] or ""
         except Exception:
             LOGGER.exception("Cannot build job log details for job %s", job["id"])
         parts = [f"{label}: {title or 'không rõ video'}"]
+        if account:
+            parts.append(f"Tài khoản TikTok: {account}")
         if channel:
             parts.append(f"Kênh: {channel}")
         if download_link:
             parts.append(f"Link: {download_link}")
-        if account:
-            parts.append(f"Tài khoản: {account}")
         return " | ".join(parts)
 
     def _loop(self, kind: str, worker_name: str) -> None:

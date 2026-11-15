@@ -22,6 +22,7 @@ UPLOAD_STATUS_LABELS = {
     "pending": "Chờ đăng",
     "completed": "Đã đăng",
     "test_ready": "Test xong (không đăng)",
+    "no_task": "Chưa xếp lịch",
 }
 
 
@@ -45,11 +46,13 @@ class QueuePage(QWidget):
         words = QVBoxLayout()
         title = QLabel("Hàng đợi & lịch đăng")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("Danh sách video đã xử lý xong và đang chờ đăng lên TikTok.")
+        subtitle = QLabel(
+            "Video đã xử lý xong, kèm lịch đăng TikTok. Video chưa có lịch "
+            "(tài khoản tắt) vẫn hiện với trạng thái Chưa xếp lịch.")
         subtitle.setObjectName("pageSubtitle")
         words.addWidget(title)
         words.addWidget(subtitle)
-        header_layout.addLayout(words)
+        header_layout.addLayout(words, 1)
         header_layout.addStretch()
         refresh = QPushButton("Làm mới")
         refresh.clicked.connect(self.refresh)
@@ -65,16 +68,16 @@ class QueuePage(QWidget):
         filters.addStretch()
         layout.addLayout(filters)
 
-        self.table = CopyableTable(0, 7)
+        self.table = CopyableTable(0, 8)
         self.table.setHorizontalHeaderLabels([
-            "Video", "Tài khoản TikTok", "Test", "Caption", "Trạng thái",
-            "Lịch đăng", "Đã đăng",
+            "Video", "Tạo lúc", "Tài khoản TikTok", "Trạng thái",
+            "Caption", "Lịch đăng", "Đã đăng", "Đường dẫn",
         ])
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(False)
-        for index, width in enumerate((300, 150, 60, 300, 150, 140, 140)):
+        for index, width in enumerate((200, 170, 145, 140, 260, 120, 120, 360)):
             self.table.setColumnWidth(index, width)
         layout.addWidget(self.table, 1)
         self.pager = TablePager()
@@ -111,9 +114,12 @@ class QueuePage(QWidget):
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(task["video_title"] or ""))
-            self.table.setItem(row, 1, QTableWidgetItem(task["account_name"] or ""))
-            self.table.setItem(row, 2, QTableWidgetItem("Test" if task["is_test"] else ""))
-            self.table.setItem(row, 3, QTableWidgetItem(task["caption"] or ""))
-            self.table.setItem(row, 4, QTableWidgetItem(UPLOAD_STATUS_LABELS.get(task["status"], task["status"])))
+            self.table.setItem(row, 1, QTableWidgetItem(format_local_time(task["created_at"])))
+            self.table.setItem(row, 2, QTableWidgetItem(task["account_name"] or "Chưa gán"))
+            self.table.setItem(row, 3, QTableWidgetItem(UPLOAD_STATUS_LABELS.get(task["status"], task["status"])))
+            self.table.setItem(row, 4, QTableWidgetItem(task["caption"] or ""))
             self.table.setItem(row, 5, QTableWidgetItem(format_local_time(task["scheduled_at"])))
             self.table.setItem(row, 6, QTableWidgetItem(format_local_time(task["posted_at"])))
+            self.table.setItem(row, 7, QTableWidgetItem(task["path"] or ""))
+        # Fit the two-line caption (title + hashtags) and long paths.
+        self.table.resizeRowsToContents()
