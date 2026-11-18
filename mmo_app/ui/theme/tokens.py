@@ -109,12 +109,12 @@ def stylesheet(mode: ThemeMode, font_pt: float = DEFAULT_FONT_PT) -> str:
     QCheckBox {{ spacing: 8px; }}
     QProgressBar {{ background: {t['surface_alt']}; border: none; border-radius: 2px; }}
     QProgressBar::chunk {{ background: {t['primary']}; border-radius: 2px; }}
-    QScrollBar:vertical {{ background: transparent; width: 12px; margin: 2px; }}
-    QScrollBar::handle:vertical {{ background: {t['border']}; border-radius: 5px; min-height: 28px; }}
+    QScrollBar:vertical {{ background: transparent; width: 16px; margin: 2px; }}
+    QScrollBar::handle:vertical {{ background: {t['border']}; border-radius: 6px; min-height: 32px; }}
     QScrollBar::handle:vertical:hover {{ background: {t['muted']}; }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-    QScrollBar:horizontal {{ background: transparent; height: 12px; margin: 2px; }}
-    QScrollBar::handle:horizontal {{ background: {t['border']}; border-radius: 5px; min-width: 28px; }}
+    QScrollBar:horizontal {{ background: transparent; height: 16px; margin: 2px; }}
+    QScrollBar::handle:horizontal {{ background: {t['border']}; border-radius: 6px; min-width: 32px; }}
     QScrollBar::handle:horizontal:hover {{ background: {t['muted']}; }}
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}

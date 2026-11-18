@@ -191,6 +191,13 @@ class WebSubService:
             LOGGER.info("WebSub unsubscribed channel=%s", channel_id)
             self._event("info", f"WebSub đã unsubscribe kênh YouTube: {self._channel_label(channel_id)}")
 
+    def _channel_active(self, channel_id: str) -> bool:
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT active FROM channels WHERE channel_id=?", (channel_id,)
+            ).fetchone()
+        return bool(row and row["active"])
+
     def receive_notification(self, body: bytes) -> int:
         root = ET.fromstring(body)
         count = 0
@@ -199,14 +206,25 @@ class WebSubService:
             channel_id = entry.findtext(f"{{{YT}}}channelId", "")
             title = entry.findtext(f"{{{ATOM}}}title", "")
             published = entry.findtext(f"{{{ATOM}}}published", "")
-            if video_id and channel_id and self.youtube.discover(video_id, channel_id, title, published):
+            if not (video_id and channel_id):
+                continue
+            if not self._channel_active(channel_id):
+                LOGGER.info(
+                    "WebSub notification ignored paused channel=%s video=%s",
+                    channel_id, video_id)
+                self._event(
+                    "info",
+                    f"WebSub bỏ qua video mới vì kênh đang tạm dừng: {title or video_id} | kênh: {self._channel_label(channel_id)} | link: https://www.youtube.com/watch?v={video_id}",
+                )
+                continue
+            if self.youtube.discover(video_id, channel_id, title, published):
                 LOGGER.info("WebSub notification queued video=%s channel=%s title=%s", video_id, channel_id, title)
                 self._event(
                     "info",
                     f"WebSub đã nhận thông báo video mới: {title or video_id} | kênh: {self._channel_label(channel_id)} | link: https://www.youtube.com/watch?v={video_id}",
                 )
                 count += 1
-            elif video_id and channel_id:
+            else:
                 LOGGER.info("WebSub notification ignored duplicate video=%s channel=%s", video_id, channel_id)
                 self._event(
                     "info",

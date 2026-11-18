@@ -45,6 +45,10 @@ class Database:
             for name, declaration in additions.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE channels ADD COLUMN {name} {declaration}")
+            media_columns = {row["name"] for row in connection.execute("PRAGMA table_info(media_items)")}
+            if "caption" not in media_columns:
+                connection.execute(
+                    "ALTER TABLE media_items ADD COLUMN caption TEXT NOT NULL DEFAULT ''")
             account_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tiktok_accounts)")}
             account_additions = {
                 "mode": "TEXT NOT NULL DEFAULT 'cdp'",
@@ -140,8 +144,8 @@ class Database:
             )
             return connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
 
-    def complete(self, job_id: int) -> None:
-        self._finish(job_id, "completed", None)
+    def complete(self, job_id: int) -> bool:
+        return self._finish(job_id, "completed", None)
 
     def fail(self, job_id: int, message: str, retry: bool = True) -> None:
         with self.connect() as connection:
@@ -150,9 +154,10 @@ class Database:
             status = "retry_wait" if can_retry else "failed"
             delay = min(3600, 30 * (2 ** max(0, int(row["attempts"]) - 1))) if row else 30
             available = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+            # A job cancelled from the UI must not be resurrected by the worker finishing.
             connection.execute(
                 """UPDATE jobs SET status=?, error_message=?, available_at=?, lease_owner=NULL,
-                lease_expires_at=NULL, updated_at=? WHERE id=?""",
+                lease_expires_at=NULL, updated_at=? WHERE id=? AND status='leased'""",
                 (status, message[:4000], available, utc_now(), job_id),
             )
 
@@ -177,6 +182,34 @@ class Database:
                 (message[:4000], utc_now(), job_id),
             )
 
+    def stop_running_jobs(
+        self,
+        message: str = "Đã dừng bởi Kill job; bấm Thử lại để chạy lại",
+    ) -> int:
+        """Stop every job a worker is running right now; returns the count.
+
+        The job becomes manual_action so it shows up in "Cần xử lý" with a
+        retry/skip choice instead of silently vanishing.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM jobs WHERE status='leased'").fetchall()
+            if not rows:
+                return 0
+            now = utc_now()
+            connection.execute(
+                """UPDATE jobs SET status='manual_action', error_message=?,
+                lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+                WHERE status='leased'""",
+                (message[:4000], now),
+            )
+            connection.executemany(
+                """INSERT INTO job_events(job_id,level,message,created_at)
+                   VALUES (?,'WARNING',?,?)""",
+                [(int(row["id"]), message[:4000], now) for row in rows],
+            )
+            return len(rows)
+
     def event(self, job_id: int | None, level: str, message: str) -> None:
         with self.connect() as connection:
             connection.execute(
@@ -184,13 +217,14 @@ class Database:
                 (job_id, level, message, utc_now()),
             )
 
-    def _finish(self, job_id: int, status: str, message: str | None) -> None:
+    def _finish(self, job_id: int, status: str, message: str | None) -> bool:
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """UPDATE jobs SET status=?, error_message=?, lease_owner=NULL,
-                lease_expires_at=NULL, updated_at=? WHERE id=?""",
+                lease_expires_at=NULL, updated_at=? WHERE id=? AND status='leased'""",
                 (status, message, utc_now(), job_id),
             )
+            return cursor.rowcount > 0
 
 
 def utc_now() -> str:

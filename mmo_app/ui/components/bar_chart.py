@@ -31,7 +31,7 @@ class BarChart(QWidget):
             return
 
         margin_left, margin_right = 28, 16
-        margin_top, margin_bottom = 12, 28
+        margin_top, margin_bottom = 12, 30
         plot_width = max(1, self.width() - margin_left - margin_right)
         plot_height = max(1, self.height() - margin_top - margin_bottom)
         max_value = max(self._values) if self._values else 1
@@ -43,20 +43,27 @@ class BarChart(QWidget):
         painter.setPen(QPen(QColor("#94A3B8"), 1))
         painter.drawLine(margin_left, axis_y, margin_left + plot_width, axis_y)
 
+        if not any(self._values):
+            painter.setPen(QColor("#94A3B8"))
+            painter.drawText(
+                margin_left, margin_top, plot_width, plot_height,
+                Qt.AlignCenter, "Chưa có video đăng trong 7 ngày")
+
         for index, (label, value) in enumerate(zip(self._labels, self._values)):
             bar_height = int(plot_height * (value / max_value)) if value else 0
             x = margin_left + int(slot * index + (slot - bar_width) / 2)
             y = axis_y - bar_height
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(self._color)
-            painter.drawRoundedRect(x, y, int(bar_width), bar_height, 4, 4)
+            if value:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(self._color)
+                painter.drawRoundedRect(x, y, int(bar_width), bar_height, 4, 4)
 
             painter.setPen(QColor("#94A3B8"))
             painter.drawText(
                 int(x - slot / 2),
-                axis_y + 16,
+                axis_y + 8,
                 int(slot),
-                16,
+                18,
                 Qt.AlignHCenter | Qt.AlignTop,
                 label,
             )

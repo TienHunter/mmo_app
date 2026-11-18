@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS channels(
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS media_items(
  id INTEGER PRIMARY KEY, youtube_video_id TEXT UNIQUE, channel_id TEXT, title TEXT, source_url TEXT,
- published_at TEXT, status TEXT NOT NULL DEFAULT 'discovered', error_message TEXT,
+ published_at TEXT, status TEXT NOT NULL DEFAULT 'discovered', caption TEXT NOT NULL DEFAULT '', error_message TEXT,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS artifacts(
  id INTEGER PRIMARY KEY, media_item_id INTEGER NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL,

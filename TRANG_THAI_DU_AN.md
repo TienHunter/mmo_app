@@ -70,6 +70,16 @@ WebSub phát hiện video
 Job nằm trong bảng `jobs`, trạng thái `queued/leased/retry_wait/completed/
 failed/manual_action/cancelled`. `PipelineOrchestrator` claim job theo loại.
 
+- **Kill job** (nút ở Tổng quan, có popup xác nhận): job đang `leased` →
+  `manual_action` với message "Đã dừng bởi Kill job; bấm Thử lại để chạy lại"
+  nên hiện ở **Cần xử lý**; ghi `job_events` WARNING cho từng job và một dòng
+  hệ thống `Kill job: đã dừng X job, dừng Y tiến trình đang chạy` (hiện ở Nhật
+  ký/Hoạt động); sau đó kill tiến trình con đang chạy (`run_tracked`
+  bọc Popen; hiện áp cho 3 lệnh ffmpeg encode của ProcessHandler). Worker nhận
+  `JobKilled`, không ghi đè trạng thái; `complete()/fail()/manual_action()` chỉ
+  đổi job đang `leased`. Giới hạn: download yt-dlp và upload Playwright chạy
+  trong tiến trình app nên chỉ được đánh dấu dừng, không ngắt ngay.
+
 ## 4. Schema / migration
 
 `SCHEMA_VERSION = 8`, migration tự chạy trong `Database.migrate()`.
@@ -86,13 +96,26 @@ Các cột quan trọng:
     `active`, `gpm_profile_id`
   - AI riêng: `ai_api_url`, `ai_api_key`, `ai_model`, `ai_system_prompt` (legacy,
     fallback khi Settings trống)
+- `media_items`: `caption` lưu caption gốc sinh ra ở bước process (AI/fixed,
+  kể cả tài khoản đang tắt nên không có `upload_tasks`).
 - `upload_tasks`: `is_test`, `status` (có `test_ready`), `caption`,
   `scheduled_at`, `posted_at`, `created_at` (UTC; row cũ NULL thì UI fallback
   `media_items.updated_at`).
 - Trang **Hàng đợi & lịch đăng** hiển thị cả video đã render nhưng chưa có
   `upload_tasks` (tài khoản route đang tắt) với trạng thái **Chưa xếp lịch**,
   nên video nhận từ WebSub vẫn thấy trong queue; cột **Tạo lúc** theo UTC+7,
-  cột **Caption** giãn dòng đủ title + hashtag, cột **Đường dẫn** là file render.
+  cột **Đường dẫn** là file render. Cột **Caption** đã chuyển sang trang
+  **Thư viện video** (đọc `media_items.caption`).
+- Đăng thủ công: chọn dòng trong bảng Hàng đợi rồi bấm
+  **Đánh dấu đã đăng** → `upload_tasks.status='completed'`, điền `posted_at`,
+  `media_items.status='uploaded'`. Dòng **Chưa xếp lịch** được tạo
+  `upload_tasks` completed với account của route; dòng không có account hoặc
+  task test bị bỏ qua. Job upload đã xếp lịch mà task đã completed sẽ tự bỏ
+  qua, không đăng lại.
+- **Thu hồi đã đăng**: chọn dòng đang Đã đăng rồi bấm nút → task có job upload
+  trở về `pending` và xóa `posted_at`; task do Đánh dấu tạo ra (không có job
+  `upload:{id}`) bị xóa để dòng trở lại **Chưa xếp lịch**. `media_items` về
+  `processed` nếu không còn task completed nào khác của video đó.
 - `channel_route_sources`, `channel_routes`: route kênh YouTube → tài khoản.
 
 Cột nullable có ý nghĩa kế thừa (NULL = lấy global): `split_enabled`,
@@ -112,7 +135,9 @@ chung ở `Settings`, cột tài khoản chỉ còn làm fallback.
   Zoom >100 hoặc zoom rộng/cao lệch dùng GPU scale rồi hwdownload để crop/pad
   CPU, sau đó hwupload lại. Caption CUDA là nền trắng không bo góc (NV12);
   CPU giữ bo góc.
-- Speed áp dụng trước, chia phần theo thời lượng **sau speed**:
+- Speed áp dụng trước, chia phần theo thời lượng **sau speed**. Bốn mốc chỉnh
+  ở **Cài đặt → Cắt video tự động** (`split_threshold_seconds`, mặc định
+  300/480/900/1080 giây; nút **Mặc định** trả 4 mốc về giá trị này):
   - `<5 phút`: 1 phần
   - `5–8`: 2, `8–15`: 3, `15–18`: 4, `≥18`: 5
 - Tối đa 5 phần. Các phần không bằng hệt nhau: offset `+5%, -3%, +4%, -2%`,
@@ -137,7 +162,8 @@ cấu hình chung ở Settings; tài khoản chỉ chọn nguồn caption và ha
 
 - `active = 1`: dùng account cho route, cắt video và đăng.
 - Card tài khoản có nút **Nhân bản**: copy toàn bộ cấu hình sang tài khoản mới,
-  bỏ trống GPM Profile ID, tạo ở trạng thái tạm dừng để nhập profile mới rồi bật.
+  tạo ở trạng thái tạm dừng để nhập profile mới rồi bật. Dialog Thêm/Nhân bản tự
+  sinh **GPM Profile ID** dạng `uuid4` khi ô trống; sửa tài khoản giữ ID đã lưu.
 - `active = 0`:
   - **Vẫn** tải video, kêu chuông, cắt/render theo đúng cấu hình tài khoản
     (speed, zoom, split, overlay, background, caption, AI, output).
@@ -181,6 +207,15 @@ Chỉnh ở **Cài đặt → Hệ thống** (1–10). Worker count chỉ đọc
 đổi xong phải Dừng → Bắt đầu. Các video khác nhau có thể overlap tải/xử lý/đăng;
 thứ tự từng video vẫn download → process → upload.
 
+- `failed_job_policy` (**Cài đặt → Hệ thống → Khi job lỗi**): `retry` = tự thử
+  lại job lỗi có backoff đến `max_attempts` (mặc định 3); `manual` =
+  `manual_action`, job nằm ở **Cần xử lý** chờ Thử lại/Bỏ qua; `skip` =
+  `cancelled` rồi worker chạy job kế. Cả 3 đều ghi `job_events` WARNING/ERROR
+  và không chặn các job khác. Lỗi `ManualAction` luôn dừng job để chờ người
+  dùng, không theo cờ này. Riêng job `download` lỗi yêu cầu cookie YouTube
+  (`Sign in to confirm`, `--cookies`, file cookie thiếu) luôn dừng ngay ở
+  `failed`, không retry dù chọn `retry`.
+
 Upload cùng một tài khoản bị khóa bằng `threading.Lock` cấp class
 (`UploadHandler._account_lock`), tránh mở trùng GPM profile. Manual upload dùng
 chung khóa này.
@@ -200,7 +235,10 @@ chung khóa này.
 
 - Chuông kêu **ngay khi bắt đầu download**, dùng `notification_sound` của
   tài khoản route/test. Hỗ trợ WAV/MP3 (MP3 convert tạm qua ffmpeg).
-- Chuông lặp tối đa 30 giây, nút **Tắt chuông** ở status bar khi đang kêu.
+- Chuông lặp theo `notification_bell_seconds` (mặc định 15 giây, sửa ở Cài đặt
+  chung), nút **Tắt chuông** ở status bar khi đang kêu.
+- Panel Trạng thái hoạt động hiện số job đang chạy và đang chờ của từng tầng,
+  ví dụ `Tải video: Đang chạy (1) · 2 chờ`.
 - Mọi thời gian UI hiển thị theo **UTC+7** (`format_local_time`,
   `local_today`). KPI hôm nay và biểu đồ 7 ngày cũng theo UTC+7.
 - Giao diện (2026-11-15): bảng màu sáng/tối làm lại theo token (`theme/tokens.py`),
@@ -209,7 +247,13 @@ chung khóa này.
   bảng, ô nhập có focus/hover/disabled rõ ràng. Callback theme: badge trạng thái
   và màu tầng pipeline dùng QSS property (`statusKind`, `stageState`) nên đổi
   màu đúng theo theme.
-- UX: `Ctrl+1..7` chuyển trang, `Ctrl+R` làm mới trang hiện tại (tooltip nav ghi
+- Tổng quan: nút **Tạm dừng**, **Kill job** (đỏ, xác nhận trước khi dừng job
+  đang chạy), **Bắt đầu**.
+- Trang **Hàng đợi job**: bảng chỉ đọc toàn bộ `jobs` (mã, loại, video, trạng
+  thái, lần thử/thử tối đa, tạo lúc, cập nhật, lỗi), mới nhất trước, màu trạng
+  thái Lỗi/Cần xử lý/Đã hủy/Hoàn tất; `Làm mới` giữ trang hiện tại, mở lại tab
+  tự refresh.
+- UX: `Ctrl+1..8` chuyển trang, `Ctrl+R` làm mới trang hiện tại (tooltip nav ghi
   phím tắt); con trỏ chờ khi Start/Pause; toast xếp chồng + fade-in 160ms, tối đa
   rộng 480px; phụ đề trang tự xuống dòng; bảng Nhật ký tự ngắt dòng và giãn chiều
   cao dòng, cột nội dung co giãn theo cửa sổ.
@@ -227,11 +271,14 @@ chung khóa này.
   `QSettings` (`ui/font_pt`). Trang Nhật ký tự giãn dòng theo nội dung/font.
 - Bảng:
   - `CopyableTable` cho video/kênh/queue/logs; click chọn ô; Ctrl+C (hoặc chuột
-    phải → **Sao chép**) copy ô/vùng chọn.
-  - Nhấn chuột trong ô rồi **kéo để bôi đen chữ ngay trên ô** (một lớp QTextEdit
-    chỉ đọc phủ đúng ô, nền theo theme/zebra), Ctrl+C copy phần bôi đen; không
-    bôi đen thì Ctrl+C copy toàn bộ nội dung ô. `Esc` hoặc click chỗ khác để
-    thoát; cuộn bảng/resize cột/model refresh tự đóng lớp này.
+    phải → **Sao chép**) copy ô/vùng chọn. Hover ô hiện tooltip đúng giá trị ô
+    (không còn tooltip hướng dẫn chung của cả bảng).
+  - Kéo chuột luôn là chọn vùng ô như bảng thường (không bị lớp phủ chặn).
+    Nháy đúp trong ô hoặc chuột phải → **Bôi đen chữ trong ô** mới mở editor
+    QTextEdit chỉ đọc phủ đúng ô (nền theo theme/zebra, xuống dòng như ô),
+    Ctrl+C copy phần bôi đen; không bôi đen thì copy toàn bộ nội dung ô.
+    `Esc` hoặc click chỗ khác để đóng editor.
+  - Bảng Kênh có 6 cột cuộn ngang bình thường (không đóng băng cột Thao tác).
   - Kéo cột, line lưới, màu xen kẽ (light `#FFFFFF/#EDF1F7`, dark
     `#131D2E/#1B2739`), hover cả dòng (light `#E6EEFF`, dark `#2B3E5C`).
   - Phân trang client-side mặc định **100 dòng/trang**, chọn 20/50/100.
@@ -273,6 +320,8 @@ chung khóa này.
 - Kênh mới: route dùng ngay; WebSub subscription được refresh ngay khi app đang chạy,
   YouTube xác minh async. Nếu lỗi/không chắc: Dừng → Bắt đầu để force renew.
 - Xóa/tạm dừng kênh chưa unsubscribe WebSub; subscription cũ có thể còn đến hết hạn.
+  Notification từ kênh đang tạm dừng (hoặc không còn trong DB) bị bỏ qua: không tạo
+  `media_items`, không enqueue download/process.
 
 ## 11. File quan trọng
 
@@ -286,7 +335,7 @@ mmo_app/
   ui/
     main_window.py         # shell, panel, tray, wheel guard
     components/            # ActivityPanel, CopyableTable, DataTable, TablePager, ...
-    pages/                 # dashboard/accounts/videos/channels/queue/logs/settings
+    pages/                 # dashboard/accounts/videos/channels/queue/jobs/logs/settings
     dialogs/               # AccountDialog, ChannelDialog
     services/repository.py # SQL cho UI, format UTC+7, pipeline_activity/ETA
     theme/tokens.py        # QSS light/dark
@@ -335,6 +384,14 @@ file sửa chưa commit (CUDA, caption global, download quality, cookie, UI tabl
     khoản chỉ fallback.
 17. Máy hiện chưa có AI API key; chọn source AI mà thiếu key sẽ fallback caption
     fixed/title và ghi warning.
+18. Render có watchdog thời gian: CUDA tối thiểu 300s, CPU tối thiểu 900s
+    (theo độ dài phần). Quá hạn thì kill ffmpeg, xóa file mp4 dở và fallback
+    CPU; không còn treo tới timeout 7200s khi driver/NVENC đứng (0% CPU,
+    file thiếu `moov`).
+19. Worker tự `recover_expired_leases()` mỗi 30s khi pipeline chạy; dashboard
+    không tính job có lease đã hết hạn là "Đang chạy" (hiện "Đang chờ"). Tắt/mở
+    lại app không còn job kẹt `leased` vĩnh viễn; luôn kiểm tra/kill
+    `ffmpeg.exe` mồ côi trước khi chạy lại job đang dở.
 
 ## 13. Quyết định không nên phá
 

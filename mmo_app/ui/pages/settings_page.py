@@ -23,6 +23,9 @@ from ...application import Application
 from ..components import show_toast
 
 
+_DEFAULT_SPLIT_THRESHOLDS = (300, 480, 900, 1080)
+
+
 class SettingsPage(QWidget):
     def __init__(self, application: Application):
         super().__init__()
@@ -66,6 +69,7 @@ class SettingsPage(QWidget):
         layout.addWidget(header)
 
         layout.addWidget(self._build_general())
+        layout.addWidget(self._build_split())
         layout.addWidget(self._build_tracking())
         layout.addWidget(self._build_caption())
         layout.addWidget(self._build_system())
@@ -90,8 +94,45 @@ class SettingsPage(QWidget):
         self.output_dir = QLineEdit()
         output_row = self._path_row(self.output_dir)
         form.addRow("Thư mục video mặc định", output_row)
+        self.notification_bell_seconds = QSpinBox()
+        self.notification_bell_seconds.setRange(1, 300)
+        self.notification_bell_seconds.setSuffix(" giây")
+        self.notification_bell_seconds.setToolTip(
+            "Chuông lặp trong khoảng thời gian này rồi tự tắt; nút Tắt chuông vẫn dừng ngay.")
+        form.addRow("Thời gian chuông", self.notification_bell_seconds)
         form.addRow("Cách nhận video mới", QLabel("WebSub (YouTube Push)"))
         return card
+
+    def _build_split(self) -> QFrame:
+        card, form = self._section("Cắt video tự động")
+        self.split_thresholds: list[QSpinBox] = []
+        for index, default in enumerate(_DEFAULT_SPLIT_THRESHOLDS):
+            box = QSpinBox()
+            box.setRange(10, 21600)
+            box.setSingleStep(30)
+            box.setSuffix(" giây")
+            box.setValue(default)
+            self.split_thresholds.append(box)
+            form.addRow(f"Chia {index + 2} phần từ", box)
+        reset = QPushButton("Mặc định")
+        reset.setToolTip("Đặt lại 4 mốc về 300 / 480 / 900 / 1080 giây")
+        reset.clicked.connect(self._reset_split_thresholds)
+        form.addRow("", reset)
+        hint = QLabel(
+            "Mốc tính trên thời lượng sau khi áp tốc độ của tài khoản "
+            "(thời lượng gốc ÷ speed). Mặc định 300/480/900/1080 giây: dưới 300s "
+            "thành 1 phần, từ 300s thành 2, từ 480s thành 3, từ 900s thành 4, "
+            "từ 1080s thành 5 phần. Tắt chia phần trong cấu hình tài khoản thì "
+            "luôn còn 1 phần."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("muted")
+        form.addRow("", hint)
+        return card
+
+    def _reset_split_thresholds(self) -> None:
+        for box, value in zip(self.split_thresholds, _DEFAULT_SPLIT_THRESHOLDS):
+            box.setValue(value)
 
     def _build_tracking(self) -> QFrame:
         card, form = self._section("Theo dõi YouTube")
@@ -202,6 +243,17 @@ class SettingsPage(QWidget):
         self.max_upload_workers = QSpinBox()
         self.max_upload_workers.setRange(1, 10)
         form.addRow("Số tài khoản đăng đồng thời", self.max_upload_workers)
+        self.failed_job_policy = QComboBox()
+        self.failed_job_policy.addItem(
+            "Tự thử lại job lỗi (tối đa 3 lần)", "retry")
+        self.failed_job_policy.addItem(
+            "Dừng job, chờ Thử lại/Bỏ qua", "manual")
+        self.failed_job_policy.addItem(
+            "Tự hủy job lỗi, chạy job tiếp theo", "skip")
+        self.failed_job_policy.setToolTip(
+            "Áp dụng khi job lỗi (ví dụ ffmpeg trả mã lỗi). Job lỗi luôn rời "
+            "worker ngay; các job khác vẫn tiếp tục chạy.")
+        form.addRow("Khi job lỗi", self.failed_job_policy)
         hint = QLabel(
             "Cấu hình xử lý video và đăng TikTok (tốc độ, zoom, cắt phần, "
             "quyền đăng, output, chuông) được quản lý trong từng tài khoản TikTok. "
@@ -247,6 +299,11 @@ class SettingsPage(QWidget):
         s = self.application.settings
         self.download_dir.setText(s.download_dir)
         self.output_dir.setText(s.output_dir)
+        self.notification_bell_seconds.setValue(int(s.notification_bell_seconds))
+        thresholds = list(getattr(s, "split_threshold_seconds", None) or [])
+        for index, box in enumerate(self.split_thresholds):
+            if index < len(thresholds):
+                box.setValue(int(thresholds[index]))
         self.public_domain.setText(s.public_domain)
         self.webhook_host.setText(s.webhook_host)
         self.webhook_port.setValue(s.webhook_port)
@@ -266,6 +323,8 @@ class SettingsPage(QWidget):
         self.max_download_workers.setValue(int(s.max_download_workers))
         self.max_process_workers.setValue(int(s.max_process_workers))
         self.max_upload_workers.setValue(s.max_upload_workers)
+        self.failed_job_policy.setCurrentIndex(max(
+            0, self.failed_job_policy.findData(s.failed_job_policy)))
 
     def _save(self) -> None:
         s = self.application.settings
@@ -280,6 +339,8 @@ class SettingsPage(QWidget):
         )
         s.download_dir = self.download_dir.text().strip()
         s.output_dir = self.output_dir.text().strip()
+        s.notification_bell_seconds = self.notification_bell_seconds.value()
+        s.split_threshold_seconds = [box.value() for box in self.split_thresholds]
         s.public_domain = self.public_domain.text().strip().rstrip("/")
         s.webhook_host = self.webhook_host.text().strip() or "127.0.0.1"
         s.webhook_port = self.webhook_port.value()
@@ -297,6 +358,7 @@ class SettingsPage(QWidget):
         s.max_download_workers = self.max_download_workers.value()
         s.max_process_workers = self.max_process_workers.value()
         s.max_upload_workers = self.max_upload_workers.value()
+        s.failed_job_policy = self.failed_job_policy.currentData() or "retry"
         s.save()
         if websub_changed and self.application.started:
             self.application.restart_websub()

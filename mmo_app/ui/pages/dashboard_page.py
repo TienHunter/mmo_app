@@ -8,7 +8,9 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -37,6 +39,7 @@ class DashboardPage(QWidget):
         application: Application,
         start_all: Callable[[], None],
         pause_all: Callable[[], None],
+        kill_running: Callable[[], tuple[int, int]],
         navigate: Callable[[int], None],
     ):
         super().__init__()
@@ -44,6 +47,7 @@ class DashboardPage(QWidget):
         self.repository = UIRepository(application.database)
         self._start_all = start_all
         self._pause_all = pause_all
+        self._kill_running_callback = kill_running
         self._navigate = navigate
         self._build()
         self.refresh()
@@ -107,14 +111,41 @@ class DashboardPage(QWidget):
         words.addWidget(subtitle)
         header_layout.addLayout(words, 1)
         header_layout.addStretch()
-        pause = QPushButton("Tạm dừng tất cả")
+        pause = QPushButton("Tạm dừng")
         pause.clicked.connect(self._pause_all)
-        start = QPushButton("Bắt đầu tất cả")
+        kill = QPushButton("Kill job")
+        kill.setObjectName("dangerButton")
+        kill.setToolTip(
+            "Hủy mọi job đang chạy và dừng tiến trình cắt video bị treo.")
+        kill.clicked.connect(self._kill_jobs)
+        start = QPushButton("Bắt đầu")
         start.setObjectName("primaryButton")
         start.clicked.connect(self._start_all)
         header_layout.addWidget(pause)
+        header_layout.addWidget(kill)
         header_layout.addWidget(start)
         return header
+
+    def _kill_jobs(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Kill job",
+            "Dừng tất cả job đang chạy? Tiến trình đang xử lý (ví dụ ffmpeg cắt "
+            "video) sẽ bị dừng ngay và job chuyển vào Cần xử lý để bạn chọn "
+            "Thử lại hoặc Bỏ qua.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        stopped, processes = self._kill_running_callback()
+        parts = []
+        if stopped:
+            parts.append(f"Đã dừng {stopped} job")
+        if processes:
+            parts.append(f"dừng {processes} tiến trình")
+        show_toast(self, (", ".join(parts) or "Không có job nào đang chạy") + ".", "info")
+        self.refresh()
 
     def _build_attention(self) -> QFrame:
         card = QFrame()
@@ -167,6 +198,9 @@ class DashboardPage(QWidget):
         layout.addWidget(QLabel("Hoạt động gần đây", objectName="pageTitle"))
         self.activity_table = DataTable()
         self.activity_table.set_columns(["Thời gian", "Nội dung"])
+        activity_header = self.activity_table.horizontalHeader()
+        activity_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        activity_header.setSectionResizeMode(1, QHeaderView.Stretch)
         activity_font = self.activity_table.font()
         activity_font.setWeight(QFont.DemiBold)
         self.activity_table.setFont(activity_font)

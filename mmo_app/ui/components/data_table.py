@@ -23,13 +23,11 @@ class DataTable(QTableView):
         self.setModel(self._model)
         self.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.setEditTriggers(
-            QAbstractItemView.SelectedClicked
-            | QAbstractItemView.DoubleClicked
-            | QAbstractItemView.EditKeyPressed)
+        # Dragging stays cell-range selection; text selection opens explicitly
+        # (double-click or context menu) in a wrapped read-only editor.
+        self.setEditTriggers(QAbstractItemView.DoubleClicked)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.setItemDelegate(_ReadOnlyTextDelegate(self))
-        self.setToolTip(
-            "Kéo chuột trong ô để bôi đen chữ rồi Ctrl+C sao chép phần bôi đen (Esc để thoát). Không bôi đen thì Ctrl+C sao chép ô/vùng chọn.")
         self.setAlternatingRowColors(True)
         self.setShowGrid(True)
         self.setSortingEnabled(True)

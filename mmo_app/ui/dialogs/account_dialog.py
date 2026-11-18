@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -151,7 +153,7 @@ class AccountDialog(QDialog):
 
         self.notification_sound = QLineEdit()
         self.notification_sound.setPlaceholderText("Để trống để dùng âm thanh mặc định của Windows")
-        self.notification_sound.setToolTip("Hỗ trợ WAV và MP3; chuông lặp tối đa 30 giây và có nút tắt.")
+        self.notification_sound.setToolTip("Hỗ trợ WAV và MP3; chuông lặp theo thời gian cấu hình ở Cài đặt chung và có nút tắt.")
         storage_form.addRow(
             "Âm thanh chuông", self._path_row(self.notification_sound, "sound"))
 
@@ -185,6 +187,10 @@ class AccountDialog(QDialog):
                 max(0, self.caption_mode.findData(account.get("caption_mode") or "")))
             self.output_dir.setText(account.get("output_dir") or "")
             self.notification_sound.setText(account.get("notification_sound") or "")
+
+        # Add/duplicate starts with a fresh GPM profile id; edit keeps the saved one.
+        if not self.gpm_profile_id.text().strip():
+            self.gpm_profile_id.setText(str(uuid.uuid4()))
 
     def _path_row(self, edit: QLineEdit, kind: str) -> QWidget:
         row = QWidget()

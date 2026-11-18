@@ -65,7 +65,7 @@ def channel_account(connection, channel_id: str | None):
 class NotificationBell:
     """Loop a notification sound for a fixed duration with a manual stop."""
 
-    def __init__(self, duration_seconds: int = 30):
+    def __init__(self, duration_seconds: int = 15):
         self.duration_seconds = max(1, int(duration_seconds))
         self._lock = threading.Lock()
         self._generation = 0
@@ -78,10 +78,13 @@ class NotificationBell:
         with self._lock:
             return self._playing
 
-    def play(self, sound_path: str = "", ffmpeg_binary: str = "ffmpeg") -> bool:
+    def play(self, sound_path: str = "", ffmpeg_binary: str = "ffmpeg",
+             duration_seconds: int | None = None) -> bool:
         """Start the bell loop. Returns False on non-Windows systems."""
         if os.name != "nt":
             return False
+        duration = max(1, int(
+            duration_seconds if duration_seconds is not None else self.duration_seconds))
         with self._lock:
             self._generation += 1
             generation = self._generation
@@ -92,7 +95,8 @@ class NotificationBell:
         previous_event.set()
         thread = threading.Thread(
             target=self._run,
-            args=(generation, event, str(sound_path or ""), str(ffmpeg_binary or "ffmpeg")),
+            args=(generation, event, str(sound_path or ""), str(ffmpeg_binary or "ffmpeg"),
+                  duration),
             name="notification-bell",
             daemon=True,
         )
@@ -114,7 +118,7 @@ class NotificationBell:
                 pass
 
     def _run(self, generation: int, event: threading.Event,
-             sound_path: str, ffmpeg_binary: str) -> None:
+             sound_path: str, ffmpeg_binary: str, duration_seconds: int) -> None:
         import winsound
         temporary: Path | None = None
         try:
@@ -125,7 +129,8 @@ class NotificationBell:
                     playable = sound
                 else:
                     try:
-                        temporary = self._convert_to_wav(sound, ffmpeg_binary)
+                        temporary = self._convert_to_wav(
+                            sound, ffmpeg_binary, duration_seconds)
                         playable = temporary
                     except Exception:
                         LOGGER.exception("Cannot convert notification sound to WAV: %s", sound)
@@ -137,9 +142,9 @@ class NotificationBell:
                     winsound.SND_FILENAME | winsound.SND_ASYNC
                     | winsound.SND_LOOP | winsound.SND_NODEFAULT,
                 )
-                event.wait(self.duration_seconds)
+                event.wait(duration_seconds)
             else:
-                deadline = time.monotonic() + self.duration_seconds
+                deadline = time.monotonic() + duration_seconds
                 while not event.is_set() and time.monotonic() < deadline:
                     winsound.MessageBeep(winsound.MB_ICONASTERISK)
                     event.wait(1.0)
@@ -158,12 +163,15 @@ class NotificationBell:
             if temporary:
                 temporary.unlink(missing_ok=True)
 
-    def _convert_to_wav(self, source: Path, ffmpeg_binary: str) -> Path:
+    def _convert_to_wav(self, source: Path, ffmpeg_binary: str,
+                        duration_seconds: int | None = None) -> Path:
         import uuid
         temporary = Path(tempfile.gettempdir()) / f"mmo_bell_{uuid.uuid4().hex}.wav"
         command = [
             ffmpeg_binary or "ffmpeg", "-y", "-i", str(source),
-            "-t", str(self.duration_seconds), "-vn", "-ac", "1", "-ar", "44100",
+            "-t", str(max(1, int(duration_seconds if duration_seconds is not None
+                                 else self.duration_seconds))),
+            "-vn", "-ac", "1", "-ar", "44100",
             str(temporary),
         ]
         try:
@@ -182,9 +190,10 @@ class NotificationBell:
 NOTIFICATION_BELL = NotificationBell()
 
 
-def play_notification_bell(sound_path: str = "", ffmpeg_binary: str = "ffmpeg") -> bool:
-    """Play the per-account notification sound, looping for up to 30 seconds."""
-    return NOTIFICATION_BELL.play(sound_path, ffmpeg_binary)
+def play_notification_bell(sound_path: str = "", ffmpeg_binary: str = "ffmpeg",
+                           duration_seconds: int | None = None) -> bool:
+    """Play the per-account notification sound, looping for the configured duration."""
+    return NOTIFICATION_BELL.play(sound_path, ffmpeg_binary, duration_seconds)
 
 
 def local_today() -> str:
@@ -225,6 +234,57 @@ def _hide_child_console_windows():
         yield
     finally:
         subprocess.Popen = original_popen
+
+
+class JobKilled(RuntimeError):
+    """Raised when the Kill job button terminates a running child process."""
+
+
+_ACTIVE_PROCESSES: dict[subprocess.Popen, bool] = {}
+_ACTIVE_PROCESSES_LOCK = threading.Lock()
+
+
+def run_tracked(command, *, timeout=None, check=False, capture_output=False, **kwargs):
+    """subprocess.run for job work that Kill job can terminate."""
+    if capture_output:
+        kwargs.setdefault("stdout", subprocess.PIPE)
+        kwargs.setdefault("stderr", subprocess.PIPE)
+    process = subprocess.Popen(command, **kwargs)
+    with _ACTIVE_PROCESSES_LOCK:
+        _ACTIVE_PROCESSES[process] = False
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        with _ACTIVE_PROCESSES_LOCK:
+            _ACTIVE_PROCESSES.pop(process, None)
+        raise
+    with _ACTIVE_PROCESSES_LOCK:
+        killed = _ACTIVE_PROCESSES.pop(process, False)
+    if killed:
+        raise JobKilled("Đã hủy tiến trình đang chạy theo yêu cầu Kill job")
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    if check:
+        result.check_returncode()
+    return result
+
+
+def kill_active_processes() -> int:
+    """Terminate every tracked job subprocess; returns the number actually killed."""
+    with _ACTIVE_PROCESSES_LOCK:
+        processes = list(_ACTIVE_PROCESSES)
+        for process in processes:
+            _ACTIVE_PROCESSES[process] = True
+    killed = 0
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.kill()
+                killed += 1
+            except OSError:
+                pass
+    return killed
 
 
 class YouTubeService:
@@ -513,7 +573,10 @@ class DownloadHandler:
             )
             if account and "notification_sound" in account.keys():
                 sound_path = str(account["notification_sound"] or "").strip()
-        if play_notification_bell(sound_path, self.settings.media_binary("ffmpeg")):
+        if play_notification_bell(
+                sound_path,
+                self.settings.media_binary("ffmpeg"),
+                int(getattr(self.settings, "notification_bell_seconds", 15) or 15)):
             self.db.event(
                 job_id, "INFO",
                 f"Thông báo: đã phát chuông bắt đầu tải video: {title}")
@@ -710,7 +773,9 @@ class ProcessHandler:
             if options.split_enabled is None else bool(options.split_enabled)
         )
         total_parts = self.part_count_for_duration(
-            effective_duration) if split_enabled else 1
+            effective_duration,
+            getattr(self.settings, "split_threshold_seconds", None),
+        ) if split_enabled else 1
         segment_ranges = self.segment_ranges_for_parts(
             effective_duration, total_parts)
         self.db.event(
@@ -730,6 +795,14 @@ class ProcessHandler:
                     job["id"],
                     "INFO",
                     f"AI đã sinh caption/hashtag cho video: {media['title']}\n{prepared_caption}",
+                )
+        if prepared_caption:
+            # Caption is generated during process, so persist it even when the
+            # account is paused and no upload_task will be created.
+            with self.db.connect() as connection:
+                connection.execute(
+                    "UPDATE media_items SET caption=?,updated_at=? WHERE id=?",
+                    (prepared_caption, utc_now(), media["id"]),
                 )
         for index, (output_start, output_length) in enumerate(segment_ranges, start=1):
             destination = self.output_path(
@@ -833,14 +906,22 @@ class ProcessHandler:
         )
 
     @staticmethod
-    def part_count_for_duration(duration: float) -> int:
+    def part_count_for_duration(duration: float,
+                                thresholds: list[float] | tuple[float, ...] | None = None) -> int:
         """Map the speed-adjusted duration to the configured number of parts."""
-        if duration < SPLIT_THRESHOLDS_SECONDS[0]:
+        limits: list[float] = []
+        for value in thresholds or SPLIT_THRESHOLDS_SECONDS:
+            try:
+                limits.append(max(1.0, float(value)))
+            except (TypeError, ValueError):
+                continue
+        limits = sorted(limits) or list(SPLIT_THRESHOLDS_SECONDS)
+        if duration < limits[0]:
             return 1
-        for index, threshold in enumerate(SPLIT_THRESHOLDS_SECONDS[1:], start=2):
+        for index, threshold in enumerate(limits[1:], start=2):
             if duration < threshold:
                 return index
-        return MAX_VIDEO_PARTS
+        return min(MAX_VIDEO_PARTS, len(limits) + 1)
 
     @staticmethod
     def segment_ranges_for_parts(duration: float, parts: int) -> list[tuple[float, float]]:
@@ -1085,28 +1166,45 @@ class ProcessHandler:
                 cuda_command += ["-c:v", codec, *codec_args, "-c:a", "aac",
                                  "-movflags", "+faststart", str(destination)]
         output_args = ["-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(destination)]
+        output_seconds = float(length) / options.speed if length is not None else None
+        # GPU/CPU encode normally finishes within a few times the output length.
+        # A watchdog timeout stops a driver-level ffmpeg hang instead of waiting 2 hours.
+        cuda_timeout = max(300.0, output_seconds) if output_seconds else 900.0
+        cpu_timeout = max(900.0, output_seconds * 4) if output_seconds else 3600.0
         try:
             if cuda_command is not None:
                 try:
-                    subprocess.run(cuda_command, capture_output=True, check=True,
-                                   timeout=7200, **_hidden_subprocess_kwargs())
+                    run_tracked(cuda_command, capture_output=True, check=True,
+                                timeout=cuda_timeout, **_hidden_subprocess_kwargs())
                     return
+                except subprocess.TimeoutExpired:
+                    LOGGER.warning(
+                        "Pipeline CUDA treo quá %.0fs, hủy và chuyển sang CPU (libx264)", cuda_timeout)
+                    encoder_name = "cpu"
+                    codec, codec_args = VIDEO_ENCODER_ARGS["cpu"]
                 except subprocess.CalledProcessError:
                     LOGGER.exception("Pipeline CUDA lỗi, chuyển sang CPU (libx264)")
                     encoder_name = "cpu"
                     codec, codec_args = VIDEO_ENCODER_ARGS["cpu"]
             encode_command = command + ["-c:v", codec, *codec_args] + output_args
             try:
-                subprocess.run(encode_command, capture_output=True, check=True,
-                               timeout=7200, **_hidden_subprocess_kwargs())
+                run_tracked(encode_command, capture_output=True, check=True,
+                            timeout=cpu_timeout, **_hidden_subprocess_kwargs())
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"ffmpeg không phản hồi sau {cpu_timeout:.0f}s khi xử lý {destination.name}") from exc
             except subprocess.CalledProcessError:
                 if encoder_name == "cpu":
                     raise
                 LOGGER.exception("Bộ mã hóa %s lỗi, chuyển sang CPU (libx264)", encoder_name)
                 cpu_codec, cpu_args = VIDEO_ENCODER_ARGS["cpu"]
-                subprocess.run(command + ["-c:v", cpu_codec, *cpu_args] + output_args,
-                               capture_output=True, check=True,
-                               timeout=7200, **_hidden_subprocess_kwargs())
+                run_tracked(command + ["-c:v", cpu_codec, *cpu_args] + output_args,
+                            capture_output=True, check=True,
+                            timeout=cpu_timeout, **_hidden_subprocess_kwargs())
+        except Exception:
+            # A killed/hung ffmpeg leaves a truncated mp4; remove it so a retry cannot reuse it.
+            destination.unlink(missing_ok=True)
+            raise
         finally:
             for path in temporary_files:
                 path.unlink(missing_ok=True)
@@ -1735,6 +1833,12 @@ class UploadHandler:
             ).fetchone()
         if not task:
             raise RuntimeError("Upload task không tồn tại")
+        if task["status"] == "completed":
+            # Marked as posted by hand: never upload the same task again.
+            self.db.event(
+                job["id"] if "id" in job.keys() else None, "INFO",
+                "Task đã được đánh dấu đã đăng thủ công; bỏ qua đăng tự động")
+            return
         if bool(task["is_test"]):
             with self.db.connect() as connection:
                 connection.execute(
@@ -2764,6 +2868,15 @@ class PipelineOrchestrator:
     def pause(self) -> None:
         self.pause_event.set()
 
+    def kill_running_jobs(self) -> tuple[int, int]:
+        """Stop leased jobs, then terminate their running child processes."""
+        stopped = self.db.stop_running_jobs()
+        killed = kill_active_processes()
+        self.db.event(
+            None, "WARNING",
+            f"Kill job: đã dừng {stopped} job, dừng {killed} tiến trình đang chạy")
+        return stopped, killed
+
     def stop(self, timeout: float = 10) -> None:
         self.stop_event.set()
         deadline = time.monotonic() + timeout
@@ -2845,7 +2958,14 @@ class PipelineOrchestrator:
         return " | ".join(parts)
 
     def _loop(self, kind: str, worker_name: str) -> None:
+        last_recover = 0.0
         while not self.stop_event.is_set():
+            if time.monotonic() - last_recover >= 30:
+                try:
+                    self.db.recover_expired_leases()
+                except Exception:
+                    LOGGER.exception("Cannot recover expired job leases")
+                last_recover = time.monotonic()
             if self.pause_event.is_set():
                 self.stop_event.wait(0.5)
                 continue
@@ -2862,12 +2982,36 @@ class PipelineOrchestrator:
             try:
                 self.db.event(job["id"], "INFO", f"Bắt đầu {details}")
                 self.handlers[job["kind"]].run(job)
-                self.db.complete(job["id"])
-                self.db.event(job["id"], "INFO", f"Hoàn tất {details}")
+                if self.db.complete(job["id"]):
+                    self.db.event(job["id"], "INFO", f"Hoàn tất {details}")
+                else:
+                    self.db.event(job["id"], "WARNING", "Job đã bị hủy trước khi hoàn tất")
+            except JobKilled:
+                # stop_running_jobs already wrote the status and the job event.
+                pass
             except ManualAction as exc:
                 self.db.manual_action(job["id"], str(exc))
                 self.db.event(job["id"], "WARNING", str(exc))
             except Exception as exc:
                 LOGGER.exception("Job %s failed", job["id"])
-                self.db.fail(job["id"], str(exc))
-                self.db.event(job["id"], "ERROR", str(exc))
+                self._handle_job_error(job["id"], str(exc), job["kind"])
+
+    def _handle_job_error(self, job_id: int, message: str, kind: str = "") -> None:
+        """Apply the configured failed-job policy for a crashed job."""
+        policy = str(getattr(self.settings, "failed_job_policy", "retry") or "retry")
+        lowered = message.lower()
+        # YouTube demanding cookies will not fix itself on retry.
+        cookie_blocked = kind == "download" and (
+            "cookie" in lowered or "sign in to confirm" in lowered)
+        if cookie_blocked:
+            self.db.fail(job_id, message, retry=False)
+            self.db.event(job_id, "ERROR", message)
+        elif policy == "manual":
+            self.db.manual_action(job_id, message)
+            self.db.event(job_id, "WARNING", message)
+        elif policy == "skip":
+            self.db.cancel_job(job_id, f"Tự hủy job lỗi: {message[:3000]}")
+            self.db.event(job_id, "ERROR", message)
+        else:
+            self.db.fail(job_id, message)
+            self.db.event(job_id, "ERROR", message)

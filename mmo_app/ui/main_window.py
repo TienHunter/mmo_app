@@ -19,6 +19,7 @@ from .i18n import vi
 from .pages.accounts_page import AccountsPage
 from .pages.channels_page import ChannelsPage
 from .pages.dashboard_page import DashboardPage
+from .pages.jobs_page import JobsPage
 from .pages.logs_page import LogsPage
 from .pages.queue_page import QueuePage
 from .pages.settings_page import SettingsPage
@@ -72,7 +73,9 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(0)
         content_layout.addWidget(self._build_topbar())
         self.stack = QStackedWidget()
-        self.dashboard = DashboardPage(self.application, self._start_pipeline, self._pause_pipeline, self._navigate)
+        self.dashboard = DashboardPage(
+            self.application, self._start_pipeline, self._pause_pipeline,
+            self._kill_running_jobs, self._navigate)
         self.stack.addWidget(self.dashboard)
         self.accounts = AccountsPage(self.application)
         self.stack.addWidget(self.accounts)
@@ -82,6 +85,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.channels)
         self.queue = QueuePage(self.application)
         self.stack.addWidget(self.queue)
+        self.jobs = JobsPage(self.application)
+        self.stack.addWidget(self.jobs)
         self.logs = LogsPage(self.application)
         self.stack.addWidget(self.logs)
         self.settings_page = SettingsPage(self.application)
@@ -118,7 +123,8 @@ class MainWindow(QMainWindow):
         layout.addSpacing(24)
         navigation = [
             ("⌂", vi.NAV_DASHBOARD), ("◉", vi.NAV_ACCOUNTS), ("▣", vi.NAV_VIDEOS),
-            ("◌", vi.NAV_CHANNELS), ("◷", vi.NAV_QUEUE), ("≡", vi.NAV_LOGS), ("⚙", vi.NAV_SETTINGS),
+            ("◌", vi.NAV_CHANNELS), ("◷", vi.NAV_QUEUE), ("▥", vi.NAV_JOBS),
+            ("≡", vi.NAV_LOGS), ("⚙", vi.NAV_SETTINGS),
         ]
         for index, (icon, label) in enumerate(navigation):
             button = QToolButton()
@@ -264,6 +270,9 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "Tạm dừng toàn bộ", "Tất cả tác vụ mới sẽ tạm dừng. Bạn có muốn tiếp tục?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         self.controller.pause_all()
+
+    def _kill_running_jobs(self) -> tuple[int, int]:
+        return self.application.kill_running_jobs()
 
     def _set_pipeline_state(self, running: bool) -> None:
         self.dashboard.set_running(running)

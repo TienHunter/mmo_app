@@ -5,7 +5,7 @@ import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from ...database import Database
+from ...database import Database, utc_now
 
 
 VIDEO_STATUS_LABELS = {
@@ -23,6 +23,16 @@ VIDEO_STATUS_LABELS = {
 }
 
 JOB_KIND_LABELS = {"download": "Tải", "process": "Xử lý", "upload": "Đăng"}
+
+JOB_STATUS_LABELS = {
+    "queued": "Chờ chạy",
+    "leased": "Đang chạy",
+    "retry_wait": "Chờ thử lại",
+    "completed": "Hoàn tất",
+    "failed": "Lỗi",
+    "manual_action": "Cần xử lý",
+    "cancelled": "Đã hủy",
+}
 
 
 LOCAL_TZ = timezone(timedelta(hours=7))
@@ -159,6 +169,16 @@ class UIRepository:
                 "SELECT COUNT(*) AS c FROM upload_tasks WHERE status IN ('pending','test_ready')"
             ).fetchone()["c"]
             now = datetime.now(timezone.utc)
+            now_text = now.isoformat()
+            stale_rows = connection.execute(
+                """SELECT kind,COUNT(*) AS c FROM jobs
+                   WHERE kind IN ('download','process','upload')
+                     AND status='leased' AND lease_expires_at IS NOT NULL
+                     AND lease_expires_at < ?
+                   GROUP BY kind""",
+                (now_text,),
+            ).fetchall()
+            stale_leased = {row["kind"]: int(row["c"]) for row in stale_rows}
             eta_seconds: dict[str, int | None] = {}
             running_tasks: dict[str, list[dict[str, Any]]] = {}
             for kind in kinds:
@@ -189,8 +209,9 @@ class UIRepository:
                        LEFT JOIN media_items m ON m.id=j.media_item_id
                        LEFT JOIN channels c ON c.channel_id=m.channel_id
                        WHERE j.kind=? AND j.status='leased'
+                         AND (j.lease_expires_at IS NULL OR j.lease_expires_at >= ?)
                        ORDER BY j.updated_at ASC, j.id ASC""",
-                    (kind,),
+                    (kind, now_text),
                 ).fetchall()
                 tasks: list[dict[str, Any]] = []
                 for row in rows:
@@ -241,8 +262,9 @@ class UIRepository:
         stages = []
         for kind in kinds:
             active = counts[kind]
-            leased = active.get("leased", 0)
-            waiting = active.get("queued", 0) + active.get("retry_wait", 0)
+            stale = stale_leased.get(kind, 0)
+            leased = active.get("leased", 0) - stale
+            waiting = active.get("queued", 0) + active.get("retry_wait", 0) + stale
             last = latest.get(kind)
             if leased:
                 state, detail = "running", f"{leased} tác vụ đang chạy"
@@ -261,6 +283,7 @@ class UIRepository:
                 "label": labels[kind],
                 "state": state,
                 "detail": detail,
+                "waiting": waiting,
                 "eta_seconds": eta_seconds.get(kind) if state == "running" else None,
                 "tasks": running_tasks.get(kind, []) if state == "running" else [],
             })
@@ -552,7 +575,7 @@ class UIRepository:
             params.extend([term, term])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         query = f"""SELECT m.id, m.title, m.youtube_video_id, m.channel_id, m.status,
-                          m.error_message, m.updated_at, c.title AS channel_title,
+                          m.caption, m.error_message, m.updated_at, c.title AS channel_title,
                           t.name AS account_name, t.id AS account_id
                    FROM media_items m
                    LEFT JOIN channels c ON c.channel_id = m.channel_id
@@ -574,7 +597,8 @@ class UIRepository:
         orphan_params: list[Any] = [account_id] if account_id else []
         query = f"""SELECT u.id AS id, u.status, u.caption, u.scheduled_at,
                           u.posted_at, u.error_message, u.is_test, a.path,
-                          a.segment_index,
+                          a.segment_index, u.artifact_id, u.media_item_id,
+                          u.account_id AS account_id,
                           COALESCE(u.created_at, m.updated_at) AS created_at,
                           m.title AS video_title, t.name AS account_name
                    FROM upload_tasks u
@@ -586,7 +610,8 @@ class UIRepository:
                    SELECT NULL AS id, 'no_task' AS status, '' AS caption,
                           NULL AS scheduled_at, NULL AS posted_at,
                           NULL AS error_message, 0 AS is_test, a.path,
-                          a.segment_index, m.updated_at AS created_at,
+                          a.segment_index, a.id, a.media_item_id, rt.id,
+                          m.updated_at AS created_at,
                           m.title AS video_title, rt.name AS account_name
                    FROM artifacts a
                    JOIN media_items m ON m.id = a.media_item_id
@@ -603,6 +628,66 @@ class UIRepository:
         with self.database.connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def list_jobs(self, limit: int = 2000) -> list[dict[str, Any]]:
+        """Job queue view ordered by the most recently updated job."""
+        query = """SELECT j.id, j.kind, j.status, j.attempts, j.max_attempts,
+                          j.created_at, j.updated_at,
+                          j.error_message, m.title AS video_title
+                   FROM jobs j
+                   LEFT JOIN media_items m ON m.id = j.media_item_id
+                   ORDER BY j.updated_at DESC, j.id DESC LIMIT ?"""
+        with self.database.connect() as connection:
+            rows = connection.execute(query, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_upload_task_posted(self, task: dict[str, Any]) -> bool:
+        """Mark a queue row as posted manually; creates the task if it has none."""
+        account_id = task.get("account_id")
+        if account_id is None:
+            return False
+        posted_at = utc_now()
+        with self.database.connect() as connection:
+            if task["id"] is None:
+                connection.execute(
+                    """INSERT INTO upload_tasks(
+                         media_item_id,artifact_id,account_id,status,posted_at,created_at)
+                       VALUES (?,?,?,'completed',?,?)""",
+                    (task["media_item_id"], task["artifact_id"], account_id,
+                     posted_at, task.get("created_at") or posted_at))
+            else:
+                connection.execute(
+                    "UPDATE upload_tasks SET status='completed',posted_at=? WHERE id=?",
+                    (posted_at, task["id"]))
+            connection.execute(
+                "UPDATE media_items SET status='uploaded',updated_at=? WHERE id=?",
+                (posted_at, task["media_item_id"]))
+        return True
+
+    def revert_upload_task_posted(self, task: dict[str, Any]) -> bool:
+        """Undo a posted mark; removes tasks that only the manual mark created."""
+        if task["id"] is None or task["status"] != "completed":
+            return False
+        with self.database.connect() as connection:
+            has_job = connection.execute(
+                "SELECT 1 FROM jobs WHERE kind='upload' AND idempotency_key=?",
+                (f"upload:{task['id']}",),
+            ).fetchone()
+            if has_job:
+                connection.execute(
+                    "UPDATE upload_tasks SET status='pending',posted_at=NULL WHERE id=?",
+                    (task["id"],))
+            else:
+                connection.execute(
+                    "DELETE FROM upload_tasks WHERE id=?", (task["id"],))
+            connection.execute(
+                """UPDATE media_items SET status='processed',updated_at=?
+                   WHERE id=? AND NOT EXISTS (
+                     SELECT 1 FROM upload_tasks u
+                     JOIN artifacts a ON a.id = u.artifact_id
+                     WHERE a.media_item_id=? AND u.status='completed')""",
+                (utc_now(), task["media_item_id"], task["media_item_id"]))
+        return True
 
     def list_events(
         self,
