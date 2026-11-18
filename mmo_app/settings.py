@@ -37,10 +37,13 @@ class Settings:
     websub_renew_interval_seconds: int = 3600
     subscription_lease_seconds: int = 864000
     worker_poll_seconds: int = 3
+    failed_job_policy: str = "retry"
     ffmpeg_path: str = ""
     ffprobe_path: str = ""
     segment_seconds: int = 60
     split_enabled: bool = True
+    split_threshold_seconds: list[int] = field(
+        default_factory=lambda: [300, 480, 900, 1080])
     use_vpn_for_youtube: bool = False
     youtube_cookies_path: str = ""
     download_quality: str = "best"
@@ -61,6 +64,7 @@ class Settings:
     max_download_workers: int = 2
     max_process_workers: int = 1
     max_upload_workers: int = 1
+    notification_bell_seconds: int = 15
     caption_include_title: bool = False
     caption_include_hashtags: bool = True
     hashtag_source: str = "fixed"

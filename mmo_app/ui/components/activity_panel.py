@@ -84,7 +84,8 @@ class _StageRow(QFrame):
 
     def set_state(self, state: str, detail: str,
                   eta_seconds: int | None = None,
-                  tasks: list[dict] | None = None) -> None:
+                  tasks: list[dict] | None = None,
+                  waiting: int = 0) -> None:
         symbol, label = _STAGE_STYLES.get(state, _STAGE_STYLES["idle"])
         self.dot.setText(symbol)
         for widget in (self.dot, self.state):
@@ -93,8 +94,10 @@ class _StageRow(QFrame):
             widget.style().polish(widget)
         self._clear_details()
         if state == "running" and tasks:
-            self.state.setText(
-                f"{label} ({len(tasks)})" if len(tasks) > 1 else label)
+            label_text = f"{label} ({len(tasks)})"
+            if waiting:
+                label_text += f" · {waiting} chờ"
+            self.state.setText(label_text)
             for task in tasks:
                 parts = [str(task.get("title") or "Không rõ video")]
                 if task.get("channel"):
@@ -110,7 +113,8 @@ class _StageRow(QFrame):
                 line.setToolTip(" · ".join(parts))
                 self.details_layout.addWidget(line)
         else:
-            self.state.setText(label)
+            self.state.setText(
+                f"{label} ({waiting})" if state == "waiting" and waiting else label)
             if state == "running" and eta_seconds is not None:
                 detail = f"{detail} · dự kiến còn {_format_eta(eta_seconds)}"
             line = QLabel(detail or "Chưa có hoạt động")
@@ -192,7 +196,7 @@ class ActivityPanel(QFrame):
             if row is not None:
                 row.set_state(
                     stage["state"], stage["detail"], stage.get("eta_seconds"),
-                    stage.get("tasks"))
+                    stage.get("tasks"), stage.get("waiting", 0))
         self.queue.setText(f"Hàng đợi đăng: {activity['pending_uploads']} bản ghi")
         events = activity["events"]
         signature = tuple(

@@ -79,6 +79,37 @@ class PipelineDatabaseTests(unittest.TestCase):
             row = connection.execute("SELECT status FROM jobs WHERE id=?", (again["id"],)).fetchone()
         self.assertEqual("retry_wait", row["status"])
 
+    def test_failed_job_policy_controls_job_outcome(self):
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "INSERT INTO media_items(title) VALUES ('Demo')").lastrowid
+        pipeline = PipelineOrchestrator(self.db, self.settings)
+        expected = {"retry": "retry_wait", "manual": "manual_action", "skip": "cancelled"}
+        for policy, status in expected.items():
+            self.settings.failed_job_policy = policy
+            self.db.enqueue("process", media_id, f"process:policy-{policy}")
+            job = self.db.claim(f"worker-{policy}", ("process",))
+            pipeline._handle_job_error(job["id"], "boom")
+            with self.db.connect() as connection:
+                row = connection.execute(
+                    "SELECT status FROM jobs WHERE id=?", (job["id"],)).fetchone()
+            self.assertEqual(status, row["status"], policy)
+
+    def test_cookie_download_error_does_not_retry(self):
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "INSERT INTO media_items(title) VALUES ('Cookie')").lastrowid
+        pipeline = PipelineOrchestrator(self.db, self.settings)
+        self.settings.failed_job_policy = "retry"
+        self.db.enqueue("download", media_id, "download:cookie-error")
+        job = self.db.claim("worker-cookie", ("download",))
+        pipeline._handle_job_error(
+            job["id"], "Sign in to confirm you're not a bot. Use --cookies", job["kind"])
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        self.assertEqual("failed", row["status"])
+
     def test_download_passes_ffmpeg_location_to_ytdlp(self):
         captured_options = {}
         output_path = Path(self.settings.download_dir) / "UCtest" / "Downloaded [ffmpeg00001].mp4"
@@ -382,6 +413,25 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertTrue(any("Demo Channel" in event and "https://www.youtube.com/watch?v=websub00001" in event for event in events))
         self.assertTrue(any("WebSub nhận thông báo video đã có trong hệ thống nên bỏ qua" in event for event in events))
 
+    def test_websub_ignores_notifications_from_paused_channel(self):
+        with self.db.connect() as connection:
+            connection.execute(
+                "INSERT INTO channels(channel_id,title,active) VALUES ('UCpaused','Paused Channel',0)"
+            )
+        websub = WebSubService(self.db, self.settings, YouTubeService(self.db, self.settings))
+        body = b'''<feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+        <entry><yt:videoId>paused00001</yt:videoId><yt:channelId>UCpaused</yt:channelId>
+        <title>Paused video</title><published>2026-07-07T00:00:00Z</published></entry></feed>'''
+        self.assertEqual(0, websub.receive_notification(body))
+        with self.db.connect() as connection:
+            self.assertIsNone(connection.execute(
+                "SELECT id FROM media_items WHERE youtube_video_id='paused00001'").fetchone())
+            self.assertIsNone(connection.execute(
+                "SELECT id FROM jobs WHERE kind='download'").fetchone())
+            events = [row["message"] for row in connection.execute(
+                "SELECT message FROM job_events ORDER BY id").fetchall()]
+        self.assertTrue(any("bỏ qua video mới vì kênh đang tạm dừng" in event for event in events))
+
     def test_websub_verification_marks_channel_subscribed(self):
         channel_id = "UCverify000000000000000001"
         with self.db.connect() as connection:
@@ -474,11 +524,13 @@ class PipelineDatabaseTests(unittest.TestCase):
         played = []
         original = services.play_notification_bell
         try:
-            services.play_notification_bell = lambda path="", ffmpeg_binary="ffmpeg": played.append(path) or True
+            services.play_notification_bell = (
+                lambda path="", ffmpeg_binary="ffmpeg", duration_seconds=None:
+                played.append((path, duration_seconds)) or True)
             DownloadHandler(self.db, self.settings)._notify_download_started(None, "UCbell", "Bell demo")
         finally:
             services.play_notification_bell = original
-        self.assertEqual(["bell.wav"], played)
+        self.assertEqual([("bell.wav", self.settings.notification_bell_seconds)], played)
 
     def test_notification_bell_stops_on_demand(self):
         bell = services.NotificationBell(duration_seconds=30)
@@ -503,6 +555,15 @@ class PipelineDatabaseTests(unittest.TestCase):
         }
         for duration, parts in expected.items():
             self.assertEqual(parts, ProcessHandler.part_count_for_duration(duration))
+
+    def test_part_count_uses_configured_split_thresholds(self):
+        thresholds = [60, 120, 180, 240]
+        self.assertEqual(1, ProcessHandler.part_count_for_duration(59, thresholds))
+        self.assertEqual(2, ProcessHandler.part_count_for_duration(60, thresholds))
+        self.assertEqual(3, ProcessHandler.part_count_for_duration(120, thresholds))
+        self.assertEqual(4, ProcessHandler.part_count_for_duration(180, thresholds))
+        self.assertEqual(5, ProcessHandler.part_count_for_duration(240, thresholds))
+        self.assertEqual(2, ProcessHandler.part_count_for_duration(90, [120, 60, 180, 240]))
 
     def test_parts_have_slight_length_difference_and_absorb_remainder(self):
         ranges = ProcessHandler.segment_ranges_for_parts(1000.0, 4)
@@ -1051,6 +1112,42 @@ class PipelineDatabaseTests(unittest.TestCase):
         self.assertEqual(1, activity["pending_uploads"])
         self.assertTrue(activity["events"])
 
+    def test_pipeline_activity_reports_waiting_count_while_running(self):
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "INSERT INTO media_items(youtube_video_id,channel_id,title) VALUES ('waitcount01','UCx','Waiting')"
+            ).lastrowid
+            connection.execute(
+                """INSERT INTO jobs(kind,media_item_id,idempotency_key,status)
+                   VALUES ('download',?,'wait-running','leased')""",
+                (media_id,),
+            )
+            connection.execute(
+                """INSERT INTO jobs(kind,media_item_id,idempotency_key,status)
+                   VALUES ('download',?,'wait-queued','queued')""",
+                (media_id,),
+            )
+        activity = UIRepository(self.db).pipeline_activity()
+        download = next(stage for stage in activity["stages"] if stage["kind"] == "download")
+        self.assertEqual("running", download["state"])
+        self.assertEqual(1, download["waiting"])
+
+    def test_pipeline_activity_does_not_report_expired_leases_as_running(self):
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        with self.db.connect() as connection:
+            media_id = connection.execute(
+                "INSERT INTO media_items(youtube_video_id,channel_id,title) VALUES ('stalel00001','UCx','Stale')"
+            ).lastrowid
+            connection.execute(
+                """INSERT INTO jobs(kind,media_item_id,idempotency_key,status,lease_expires_at)
+                   VALUES ('process',?,'stale-process','leased',?)""",
+                (media_id, stale),
+            )
+        activity = UIRepository(self.db).pipeline_activity()
+        process = next(stage for stage in activity["stages"] if stage["kind"] == "process")
+        self.assertEqual("waiting", process["state"])
+        self.assertEqual([], process["tasks"])
+
     def test_pipeline_report_exports_excel_rows(self):
         with self.db.connect() as connection:
             connection.execute(
@@ -1145,12 +1242,12 @@ class PipelineDatabaseTests(unittest.TestCase):
         source.write_bytes(b"source")
         destination.write_bytes(b"old")
         calls = []
-        original = services.subprocess.run
+        original = services.run_tracked
         try:
-            services.subprocess.run = lambda command, **kwargs: calls.append(command)
+            services.run_tracked = lambda command, **kwargs: calls.append(command)
             ProcessHandler(self.db, self.settings)._render(source, destination, 0, 60, "Title", 2, 2)
         finally:
-            services.subprocess.run = original
+            services.run_tracked = original
         ffmpeg_calls = [command for command in calls if any("caption.png" in str(item) for item in command)]
         self.assertEqual(1, len(ffmpeg_calls))
         command_text = ",".join(ffmpeg_calls[0])
@@ -1165,15 +1262,15 @@ class PipelineDatabaseTests(unittest.TestCase):
         source.write_bytes(b"source")
         destination.write_bytes(b"old")
         calls = []
-        original = services.subprocess.run
+        original = services.run_tracked
         try:
-            services.subprocess.run = lambda command, **kwargs: calls.append(command)
+            services.run_tracked = lambda command, **kwargs: calls.append(command)
             ProcessHandler(self.db, self.settings)._render(
                 source, destination, 0, None, "Title", 1, 1,
                 services.ProcessingOptions(60, "original", 100, 1.0, ""),
             )
         finally:
-            services.subprocess.run = original
+            services.run_tracked = original
         self.assertEqual([], calls)
 
     def test_account_processing_options_drive_speed_zoom_and_output(self):
@@ -1324,18 +1421,21 @@ class PipelineDatabaseTests(unittest.TestCase):
         with self.db.connect() as connection:
             messages = [row["message"] for row in connection.execute(
                 "SELECT message FROM job_events ORDER BY id").fetchall()]
+            stored_caption = connection.execute(
+                "SELECT caption FROM media_items WHERE id=?", (media_id,)).fetchone()["caption"]
         self.assertTrue(any(
             "AI đã sinh caption/hashtag cho video: Demo title\nAI caption\n#tag" == message
             for message in messages))
+        self.assertEqual("AI caption\n#tag", stored_caption)
 
     def test_zoom_out_and_speed_are_applied_to_ffmpeg_command(self):
         source = Path(self.temp.name) / "source.mp4"
         destination = Path(self.temp.name) / "001.mp4"
         source.write_bytes(b"source")
         calls = []
-        original = services.subprocess.run
+        original = services.run_tracked
         try:
-            services.subprocess.run = lambda command, **kwargs: calls.append(command)
+            services.run_tracked = lambda command, **kwargs: calls.append(command)
             ProcessHandler(self.db, self.settings)._render(
                 source,
                 destination,
@@ -1347,7 +1447,7 @@ class PipelineDatabaseTests(unittest.TestCase):
                 services.ProcessingOptions(60, "9:16", 80, 1.25, ""),
             )
         finally:
-            services.subprocess.run = original
+            services.run_tracked = original
         command = calls[0]
         command_text = ",".join(command)
         self.assertIn("scale=864:1536:force_original_aspect_ratio=decrease", command_text)
@@ -1361,9 +1461,9 @@ class PipelineDatabaseTests(unittest.TestCase):
         source.write_bytes(b"source")
         self.settings.video_encoder = "cuda_cq27_max"
         calls = []
-        original = services.subprocess.run
+        original = services.run_tracked
         try:
-            services.subprocess.run = lambda command, **kwargs: calls.append(command)
+            services.run_tracked = lambda command, **kwargs: calls.append(command)
             ProcessHandler(self.db, self.settings)._render(
                 source,
                 destination,
@@ -1375,7 +1475,7 @@ class PipelineDatabaseTests(unittest.TestCase):
                 services.ProcessingOptions(60, "9:16", 100, 1.0, ""),
             )
         finally:
-            services.subprocess.run = original
+            services.run_tracked = original
         command = calls[0]
         self.assertIn("h264_nvenc", command)
         self.assertIn("-cq", command)
@@ -1390,9 +1490,9 @@ class PipelineDatabaseTests(unittest.TestCase):
         source.write_bytes(b"source")
         self.settings.video_encoder = "cuda"
         calls = []
-        original = services.subprocess.run
+        original = services.run_tracked
         try:
-            services.subprocess.run = lambda command, **kwargs: calls.append(command)
+            services.run_tracked = lambda command, **kwargs: calls.append(command)
             ProcessHandler(self.db, self.settings)._render(
                 source,
                 destination,
@@ -1404,7 +1504,7 @@ class PipelineDatabaseTests(unittest.TestCase):
                 services.ProcessingOptions(60, "9:16", 120, 1.0, ""),
             )
         finally:
-            services.subprocess.run = original
+            services.run_tracked = original
         command = calls[0]
         text = " ".join(command)
         self.assertIn("-hwaccel cuda", text)
@@ -1427,7 +1527,7 @@ class PipelineDatabaseTests(unittest.TestCase):
         source.write_bytes(b"source")
         self.settings.video_encoder = "cuda"
         calls = []
-        original = services.subprocess.run
+        original = services.run_tracked
 
         def fake_run(command, **kwargs):
             calls.append(command)
@@ -1435,7 +1535,7 @@ class PipelineDatabaseTests(unittest.TestCase):
                 raise services.subprocess.CalledProcessError(1, command)
 
         try:
-            services.subprocess.run = fake_run
+            services.run_tracked = fake_run
             ProcessHandler(self.db, self.settings)._render(
                 source,
                 destination,
@@ -1447,7 +1547,39 @@ class PipelineDatabaseTests(unittest.TestCase):
                 services.ProcessingOptions(60, "9:16", 120, 1.0, ""),
             )
         finally:
-            services.subprocess.run = original
+            services.run_tracked = original
+        self.assertEqual(2, len(calls))
+        self.assertIn("h264_nvenc", " ".join(calls[0]))
+        self.assertIn("libx264", calls[1])
+
+    def test_cuda_hang_times_out_and_falls_back_to_cpu_render(self):
+        source = Path(self.temp.name) / "source.mp4"
+        destination = Path(self.temp.name) / "hang.mp4"
+        source.write_bytes(b"source")
+        self.settings.video_encoder = "cuda"
+        calls = []
+        original = services.run_tracked
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                destination.write_bytes(b"partial")
+                raise services.subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+        try:
+            services.run_tracked = fake_run
+            ProcessHandler(self.db, self.settings)._render(
+                source,
+                destination,
+                0,
+                30,
+                "Title",
+                1,
+                1,
+                services.ProcessingOptions(60, "9:16", 120, 1.0, ""),
+            )
+        finally:
+            services.run_tracked = original
         self.assertEqual(2, len(calls))
         self.assertIn("h264_nvenc", " ".join(calls[0]))
         self.assertIn("libx264", calls[1])
@@ -1457,9 +1589,9 @@ class PipelineDatabaseTests(unittest.TestCase):
         destination = Path(self.temp.name) / "001.mp4"
         source.write_bytes(b"source")
         calls = []
-        original = services.subprocess.run
+        original = services.run_tracked
         try:
-            services.subprocess.run = lambda command, **kwargs: calls.append(command)
+            services.run_tracked = lambda command, **kwargs: calls.append(command)
             ProcessHandler(self.db, self.settings)._render(
                 source,
                 destination,
@@ -1471,7 +1603,7 @@ class PipelineDatabaseTests(unittest.TestCase):
                 services.ProcessingOptions(30, "9:16", 100, 1.1, ""),
             )
         finally:
-            services.subprocess.run = original
+            services.run_tracked = original
         command = calls[0]
         self.assertLess(command.index("-t"), command.index("-i"))
         self.assertIn("setpts=PTS/1.1", ",".join(command))

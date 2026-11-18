@@ -45,6 +45,10 @@ class Application:
             self.websub_scheduler_thread.start()
         return not was_running
 
+    def kill_running_jobs(self) -> tuple[int, int]:
+        """Kill-job panic button: cancel running jobs and their subprocesses."""
+        return self.pipeline.kill_running_jobs()
+
     def pause(self) -> None:
         self.started = False
         self.stop_event.set()

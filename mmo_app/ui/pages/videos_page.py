@@ -87,13 +87,14 @@ class VideosPage(QWidget):
         filters.addWidget(search_button)
         layout.addLayout(filters)
 
-        self.table = CopyableTable(0, 5)
-        self.table.setHorizontalHeaderLabels(["Tiêu đề", "Kênh", "Trạng thái", "Tiến độ", "Cập nhật"])
+        self.table = CopyableTable(0, 6)
+        self.table.setHorizontalHeaderLabels([
+            "Tiêu đề", "Kênh", "Trạng thái", "Tiến độ", "Cập nhật", "Caption"])
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(False)
-        for index, width in enumerate((360, 180, 120, 90, 150)):
+        for index, width in enumerate((300, 150, 110, 80, 140, 320)):
             self.table.setColumnWidth(index, width)
         layout.addWidget(self.table, 1)
         self.pager = TablePager()
@@ -156,3 +157,5 @@ class VideosPage(QWidget):
             self.table.setItem(row, 2, QTableWidgetItem(VIDEO_STATUS_LABELS.get(status, status)))
             self.table.setItem(row, 3, QTableWidgetItem(f"{progress}%"))
             self.table.setItem(row, 4, QTableWidgetItem(format_local_time(video["updated_at"])))
+            self.table.setItem(row, 5, QTableWidgetItem(video["caption"] or ""))
+        self.table.resizeRowsToContents()

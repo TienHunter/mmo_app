@@ -6,6 +6,7 @@ NAV_ACCOUNTS = "Tài khoản TikTok"
 NAV_VIDEOS = "Thư viện video"
 NAV_CHANNELS = "Kênh theo dõi"
 NAV_QUEUE = "Hàng đợi & lịch đăng"
+NAV_JOBS = "Hàng đợi job"
 NAV_LOGS = "Nhật ký"
 NAV_SETTINGS = "Cài đặt"
 
